@@ -87,12 +87,6 @@
             android:layout_weight="1"
             android:text="Stop" />
 
-        <Button
-            android:id="@+id/toggle_effect_button"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Toggle Effect" />
     </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>
