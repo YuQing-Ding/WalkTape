@@ -205,14 +205,16 @@ public class MainActivity extends AppCompatActivity {
         List<AudioProcessor> effectChain = new ArrayList<>();
         switch (type) {
             case TYPE_A:
+                effectChain.add(new CustomWowFlutter(0.006f, 0.004f));
                 effectChain.add(new CustomNoise(0.2f));
                 effectChain.add(new CustomDistortion(1.5f));
+                effectChain.add(new CustomTapeHiss(0.00015f));
                 break;
             case TYPE_B:
-                effectChain.add(new CustomWowFlutter(0.003f, 0.00075f)); // WowFlutter: 0.3% to 0.075%
-                effectChain.add(new CustomNoise(0.0015f));               // Noise: 0.15%
-                effectChain.add(new CustomDistortion(0.003f));           // Distortion: 0.3%
-                effectChain.add(new CustomDropout(0.0015f));             // Dropout: 0.15%
+                effectChain.add(new CustomNoise(0.2f));
+                effectChain.add(new CustomDistortion(1.25f));
+                effectChain.add(new CustomTapeHiss(0.01f));
+                effectChain.add(new CustomWowFlutter(0.001f, 0.002f));
                 break;
             case TYPE_C:
                 effectChain.add(new CustomWowFlutter(0.004f, 0.001f));  // WowFlutter: 0.4% to 0.1%
