@@ -135,6 +135,8 @@ public class MainActivity extends AppCompatActivity {
             for (AudioProcessor processor : currentEffectChain) {
                 dispatcher.addAudioProcessor(processor);
             }
+            dispatcher.addAudioProcessor(new CustomGain(2f));
+            dispatcher.addAudioProcessor(new CustomLimiter(0.8f)); // 设置限幅器阈值
             dispatcher.addAudioProcessor(new AudioProcessor() {
                 private AudioTrack audioTrack;
                 private int bufferSize;
@@ -165,7 +167,7 @@ public class MainActivity extends AppCompatActivity {
                         short[] shortBuffer = new short[audioEvent.getBufferSize()];
                         float[] floatBuffer = audioEvent.getFloatBuffer();
                         for (int i = 0; i < floatBuffer.length; i++) {
-                            shortBuffer[i] = (short) (floatBuffer[i] * Short.MAX_VALUE * 1.85f); // Increase gain
+                            shortBuffer[i] = (short) (floatBuffer[i] * Short.MAX_VALUE); // Increase gain
                         }
 
                         audioTrack.write(shortBuffer, 0, shortBuffer.length);
