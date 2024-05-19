@@ -9,10 +9,12 @@ import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
 import android.os.Bundle;
+import android.os.Handler;
 import android.provider.MediaStore;
 import android.widget.Button;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
+import android.widget.SeekBar;
 import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
@@ -21,6 +23,9 @@ import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -38,6 +43,18 @@ public class MainActivity extends AppCompatActivity {
     private List<String> musicFiles;
     private AudioDispatcher dispatcher;
     private List<AudioProcessor> currentEffectChain;
+    private AudioTrack audioTrack;
+    private SeekBar progressBar;
+    private Handler handler;
+    private Runnable progressRunnable;
+    private Button playButton;
+    private Button stopButton;
+    private String currentFilePath;
+    private boolean isPlaying = false;
+    private int durationMs = 0;
+    private int currentPositionMs = 0;
+    private boolean isPaused = false;
+    private Thread dispatcherThread;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -90,10 +107,43 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        // 默认选择效果 A
         RadioButton defaultEffect = findViewById(R.id.effect_a);
         defaultEffect.setChecked(true);
         currentEffectChain = getEffectChain(EffectType.TYPE_A);
+
+        progressBar = findViewById(R.id.progress_bar);
+        playButton = findViewById(R.id.play_button);
+        stopButton = findViewById(R.id.stop_button);
+
+        playButton.setOnClickListener(v -> togglePlayPause());
+        stopButton.setOnClickListener(v -> stopMusic());
+
+        handler = new Handler();
+        progressRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (isPlaying && audioTrack != null) {
+                    currentPositionMs = (int) ((audioTrack.getPlaybackHeadPosition() / (float) audioTrack.getSampleRate()) * 1000);
+                    progressBar.setProgress(currentPositionMs);
+                    handler.postDelayed(this, 1000);
+                }
+            }
+        };
+
+        progressBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (fromUser && isPlaying) {
+                    seekTo(progress);
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {}
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
     }
 
     @SuppressLint("NotifyDataSetChanged")
@@ -108,7 +158,7 @@ public class MainActivity extends AppCompatActivity {
         );
 
         if (cursor != null) {
-            musicFiles.clear(); // 清空当前列表
+            musicFiles.clear();
             if (cursor.moveToFirst()) {
                 int titleColumn = cursor.getColumnIndex(MediaStore.Audio.Media.TITLE);
                 int dataColumn = cursor.getColumnIndex(MediaStore.Audio.Media.DATA);
@@ -126,27 +176,57 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void playMusicFile(String filePath) {
-        if (dispatcher != null) {
-            dispatcher.stop();
-        }
+        stopMusic(); // Stop any current playing music
 
-        new Thread(() -> {
+        currentFilePath = filePath;
+        durationMs = getMusicDuration(filePath);
+        progressBar.setMax(durationMs);
+        startAudioDispatcher(filePath, 0);
+        isPlaying = true;
+        isPaused = false;
+        playButton.setText("Pause");
+        handler.post(progressRunnable);
+    }
+
+    private int getMusicDuration(String filePath) {
+        // Using ffmpeg to get the duration
+        try {
+            ProcessBuilder processBuilder = new ProcessBuilder(
+                    "/data/user/0/com.yqdscott.walktape/cache/ffmpeg",
+                    "-i", filePath
+            );
+            Process process = processBuilder.start();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.contains("Duration:")) {
+                    String duration = line.split("Duration:")[1].split(",")[0].trim();
+                    String[] parts = duration.split(":");
+                    return (Integer.parseInt(parts[0]) * 3600 + Integer.parseInt(parts[1]) * 60 + (int) Float.parseFloat(parts[2])) * 1000;
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return 0;
+    }
+
+    private void startAudioDispatcher(String filePath, int startPositionMs) {
+        dispatcherThread = new Thread(() -> {
             dispatcher = AudioDispatcherFactory.fromPipe(filePath, 22050, 99999, 128);
             for (AudioProcessor processor : currentEffectChain) {
                 dispatcher.addAudioProcessor(processor);
             }
             dispatcher.addAudioProcessor(new CustomGain(2f));
-            dispatcher.addAudioProcessor(new CustomLimiter(0.8f)); // 设置限幅器阈值
+            dispatcher.addAudioProcessor(new CustomLimiter(0.8f));
             dispatcher.addAudioProcessor(new AudioProcessor() {
-                private AudioTrack audioTrack;
                 private int bufferSize;
 
                 @Override
                 public boolean process(AudioEvent audioEvent) {
                     if (audioTrack == null) {
-                        // Calculate buffer size
                         bufferSize = AudioTrack.getMinBufferSize((int) audioEvent.getSampleRate(),
-                                AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT) * 16; // Increased buffer size
+                                AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT) * 16;
                         audioTrack = new AudioTrack.Builder()
                                 .setAudioAttributes(new AudioAttributes.Builder()
                                         .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -167,12 +247,10 @@ public class MainActivity extends AppCompatActivity {
                         short[] shortBuffer = new short[audioEvent.getBufferSize()];
                         float[] floatBuffer = audioEvent.getFloatBuffer();
                         for (int i = 0; i < floatBuffer.length; i++) {
-                            shortBuffer[i] = (short) (floatBuffer[i] * Short.MAX_VALUE); // Increase gain
+                            shortBuffer[i] = (short) (floatBuffer[i] * Short.MAX_VALUE);
                         }
-
                         audioTrack.write(shortBuffer, 0, shortBuffer.length);
                     } catch (Exception e) {
-                        // Handle AudioTrack underrun
                         if (audioTrack != null) {
                             audioTrack.stop();
                             audioTrack.release();
@@ -180,7 +258,6 @@ public class MainActivity extends AppCompatActivity {
                         }
                         return false;
                     }
-
                     return true;
                 }
 
@@ -194,7 +271,61 @@ public class MainActivity extends AppCompatActivity {
                 }
             });
             dispatcher.run();
-        }).start();
+        });
+        dispatcherThread.start();
+    }
+
+    private void seekTo(int positionMs) {
+        if (dispatcher != null) {
+            dispatcher.stop();
+        }
+        currentPositionMs = positionMs;
+        startAudioDispatcher(currentFilePath, positionMs);
+        progressBar.setProgress(positionMs);
+    }
+
+    private void togglePlayPause() {
+        if (isPlaying) {
+            pauseMusic();
+        } else {
+            resumeMusic();
+        }
+    }
+
+    private void pauseMusic() {
+        if (dispatcher != null) {
+            dispatcher.stop();
+        }
+        isPaused = true;
+        isPlaying = false;
+        playButton.setText("Play");
+        handler.removeCallbacks(progressRunnable);
+    }
+
+    private void resumeMusic() {
+        startAudioDispatcher(currentFilePath, currentPositionMs);
+        isPaused = false;
+        isPlaying = true;
+        playButton.setText("Pause");
+        handler.post(progressRunnable);
+    }
+
+    private void stopMusic() {
+        if (dispatcher != null) {
+            dispatcher.stop();
+        }
+        if (audioTrack != null) {
+            audioTrack.stop();
+            audioTrack.release();
+            audioTrack = null;
+        }
+        isPlaying = false;
+        handler.removeCallbacks(progressRunnable);
+        progressBar.setProgress(0);
+        playButton.setText("Play");
+        if (dispatcherThread != null && dispatcherThread.isAlive()) {
+            dispatcherThread.interrupt();
+        }
     }
 
     private enum EffectType {
@@ -217,10 +348,10 @@ public class MainActivity extends AppCompatActivity {
                 effectChain.add(new CustomWowFlutter(0.001f, 0.002f));
                 break;
             case TYPE_C:
-                effectChain.add(new CustomWowFlutter(0.004f, 0.001f));  // WowFlutter: 0.4% to 0.1%
-                effectChain.add(new CustomNoise(0.002f));               // Noise: 0.2%
-                effectChain.add(new CustomDistortion(0.004f));           // Distortion: 0.4%
-                effectChain.add(new CustomDropout(0.002f));             // Dropout: 0.2%
+                effectChain.add(new CustomWowFlutter(0.004f, 0.001f));
+                effectChain.add(new CustomNoise(0.002f));
+                effectChain.add(new CustomDistortion(0.004f));
+                effectChain.add(new CustomDropout(0.002f));
                 break;
         }
         return effectChain;
@@ -229,8 +360,6 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        if (dispatcher != null) {
-            dispatcher.stop();
-        }
+        stopMusic();
     }
 }
