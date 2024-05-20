@@ -110,16 +110,16 @@ public class MainActivity extends AppCompatActivity {
                 currentEffectChain = getEffectChain(EffectType.TYPE_C);
             }
             // Always add gain and limiter to the effect chain
-            currentEffectChain.add(new CustomGain(1.6f)); // Adjust gain as needed
-            currentEffectChain.add(new CustomLimiter(0.8f));
+            currentEffectChain.add(new CustomGain(1.48f)); // Adjust gain as needed
+            currentEffectChain.add(new CustomLimiter(0.9f));
         });
 
         RadioButton defaultEffect = findViewById(R.id.effect_a);
         defaultEffect.setChecked(true);
         currentEffectChain = getEffectChain(EffectType.TYPE_A);
         // Always add gain and limiter to the effect chain
-        currentEffectChain.add(new CustomGain(1.6f)); // Adjust gain as needed
-        currentEffectChain.add(new CustomLimiter(0.8f)); // Adjust limiter threshold as needed
+        currentEffectChain.add(new CustomGain(1.48f)); // Adjust gain as needed
+        currentEffectChain.add(new CustomLimiter(0.9f)); // Adjust limiter threshold as needed
 
         progressBar = findViewById(R.id.progress_bar);
         playButton = findViewById(R.id.play_button);
@@ -453,10 +453,10 @@ public class MainActivity extends AppCompatActivity {
                 effectChain.add(new CustomSuperBass(0.6f,150f));
                 break;
             case TYPE_B://模拟TPS-L2 （暂时）
-                effectChain.add(new CustomWowFlutter(0.01f, 0.219f)); // 1 Hz 的 Wow 效果，深度为 0.219%
-                effectChain.add(new CustomWowFlutter(0.06f, 0.219f)); // 6 Hz 的 Flutter 效果，深度为 0.219%
-                effectChain.add(new CustomNoise(0.18f)); // 背景噪音
-                effectChain.add(new CustomDistortion(0.6f)); // 适中的失真水平
+                effectChain.add(new CustomWowFlutter(0.1f, 0.00219f)); // 1 Hz 的 Wow 效果，深度为 0.219%
+                effectChain.add(new CustomWowFlutter(0.4f, 0.00219f)); // 6 Hz 的 Flutter 效果，深度为 0.219%
+                effectChain.add(new CustomNoise(0.45f)); // 背景噪音
+                effectChain.add(new CustomDistortion(0.5f)); // 适中的失真水平
                 effectChain.add(new CustomTapeHiss(0.003f)); // 低水平的磁带嘶嘶声
                 effectChain.add(new CustomTapeSqueal(0.01f, 0.136f)); // 磁带尖叫声，高频噪音
                 effectChain.add(new CustomSuperBass(0.5f,150f));
@@ -472,8 +472,8 @@ public class MainActivity extends AppCompatActivity {
                 break;
         }
         // Always add gain and limiter to the effect chain
-        effectChain.add(new CustomGain(1.4f)); // Adjust gain as needed
-        effectChain.add(new CustomLimiter(99f)); // Adjust limiter threshold as needed
+        effectChain.add(new CustomGain(1.48f)); // Adjust gain as needed
+        effectChain.add(new CustomLimiter(0.9f)); // Adjust limiter threshold as needed
         return effectChain;
     }
 
