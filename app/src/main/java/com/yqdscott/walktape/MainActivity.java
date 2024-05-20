@@ -472,8 +472,8 @@ public class MainActivity extends AppCompatActivity {
                 break;
         }
         // Always add gain and limiter to the effect chain
-        effectChain.add(new CustomGain(1.6f)); // Adjust gain as needed
-        effectChain.add(new CustomLimiter(0.8f)); // Adjust limiter threshold as needed
+        effectChain.add(new CustomGain(1.4f)); // Adjust gain as needed
+        effectChain.add(new CustomLimiter(99f)); // Adjust limiter threshold as needed
         return effectChain;
     }
 
