@@ -110,7 +110,7 @@ public class MainActivity extends AppCompatActivity {
                 currentEffectChain = getEffectChain(EffectType.TYPE_C);
             }
             // Always add gain and limiter to the effect chain
-            currentEffectChain.add(new CustomGain(1.8f)); // Adjust gain as needed
+            currentEffectChain.add(new CustomGain(1.6f)); // Adjust gain as needed
             currentEffectChain.add(new CustomLimiter(0.9f));
         });
 
@@ -118,7 +118,7 @@ public class MainActivity extends AppCompatActivity {
         defaultEffect.setChecked(true);
         currentEffectChain = getEffectChain(EffectType.TYPE_A);
         // Always add gain and limiter to the effect chain
-        currentEffectChain.add(new CustomGain(1.8f)); // Adjust gain as needed
+        currentEffectChain.add(new CustomGain(1.6f)); // Adjust gain as needed
         currentEffectChain.add(new CustomLimiter(0.9f)); // Adjust limiter threshold as needed
 
         progressBar = findViewById(R.id.progress_bar);
@@ -455,7 +455,7 @@ public class MainActivity extends AppCompatActivity {
                 effectChain.add(new CustomNoise(0.2f));
                 effectChain.add(new CustomDistortion(0.85f));
                 effectChain.add(new CustomTapeHiss(0.00650f));
-                effectChain.add(new CustomWowFlutter(0.1f, 0.16f));
+                effectChain.add(new CustomWowFlutter(0.1f, 0.1f));
                 break;
             case TYPE_C:
                 effectChain.add(new CustomWowFlutter(0.004f, 0.001f));
@@ -465,7 +465,7 @@ public class MainActivity extends AppCompatActivity {
                 break;
         }
         // Always add gain and limiter to the effect chain
-        effectChain.add(new CustomGain(1.8f)); // Adjust gain as needed
+        effectChain.add(new CustomGain(1.6f)); // Adjust gain as needed
         effectChain.add(new CustomLimiter(0.9f)); // Adjust limiter threshold as needed
         return effectChain;
     }
