@@ -17,7 +17,7 @@ public class CustomWowFlutter implements AudioProcessor {
     @Override
     public boolean process(AudioEvent audioEvent) {
         float[] buffer = audioEvent.getFloatBuffer();
-        float sampleRate = audioEvent.getSampleRate();
+        float sampleRate = 22050;
         for (int i = 0; i < buffer.length; i++) {
             buffer[i] *= (float) (1 + depth * Math.sin(2 * Math.PI * rate * (phase + i) / sampleRate));
         }

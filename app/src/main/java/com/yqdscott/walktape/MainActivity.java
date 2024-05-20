@@ -110,16 +110,16 @@ public class MainActivity extends AppCompatActivity {
                 currentEffectChain = getEffectChain(EffectType.TYPE_C);
             }
             // Always add gain and limiter to the effect chain
-            currentEffectChain.add(new CustomGain(1.8f)); // Adjust gain as needed
-            currentEffectChain.add(new CustomLimiter(0.9f));
+            currentEffectChain.add(new CustomGain(1.7f)); // Adjust gain as needed
+            currentEffectChain.add(new CustomLimiter(0.8f));
         });
 
         RadioButton defaultEffect = findViewById(R.id.effect_a);
         defaultEffect.setChecked(true);
         currentEffectChain = getEffectChain(EffectType.TYPE_A);
         // Always add gain and limiter to the effect chain
-        currentEffectChain.add(new CustomGain(1.8f)); // Adjust gain as needed
-        currentEffectChain.add(new CustomLimiter(0.9f)); // Adjust limiter threshold as needed
+        currentEffectChain.add(new CustomGain(1.7f)); // Adjust gain as needed
+        currentEffectChain.add(new CustomLimiter(0.8f)); // Adjust limiter threshold as needed
 
         progressBar = findViewById(R.id.progress_bar);
         playButton = findViewById(R.id.play_button);
@@ -452,21 +452,25 @@ public class MainActivity extends AppCompatActivity {
                 effectChain.add(new CustomTapeHiss(0.00015f));
                 break;
             case TYPE_B:
-                effectChain.add(new CustomNoise(0.2f));
-                effectChain.add(new CustomDistortion(0.85f));
-                effectChain.add(new CustomTapeHiss(0.00650f));
-                effectChain.add(new CustomWowFlutter(0.1f, 0.1f));
+                effectChain.add(new CustomNoise(0.2f)); // Amount for general background noise
+                effectChain.add(new CustomDistortion(0.35f)); // Distortion to match the TPS-L2 spec
+                effectChain.add(new CustomTapeHiss(0.0004f)); // Tape hiss, kept at a low level
+                effectChain.add(new CustomWowFlutter(1.0f, 0.00219f)); // Wow effect with a 1 Hz rate, 0.219% depth
+                effectChain.add(new CustomWowFlutter(6.0f, 0.00219f)); // Flutter effect with a 6 Hz rate, 0.219% depth
+                effectChain.add(new CustomTapeSqueal(0.01f, 0.136f)); // Tape squeal for high-frequency artifacts
                 break;
             case TYPE_C:
-                effectChain.add(new CustomWowFlutter(0.004f, 0.001f));
-                effectChain.add(new CustomNoise(0.002f));
-                effectChain.add(new CustomDistortion(0.004f));
-                effectChain.add(new CustomDropout(0.002f));
+                effectChain.add(new CustomNoise(0.2f));
+                effectChain.add(new CustomDistortion(0.95f));
+                effectChain.add(new CustomTapeHiss(0.0004f));
+                effectChain.add(new CustomWowFlutter(1.0f, 0.01f)); // Wow 效果
+                effectChain.add(new CustomWowFlutter(6.0f, 0.00219f)); // Flutter 效果
+                effectChain.add(new CustomTapeSqueal(0.01f, 0.136f));
                 break;
         }
         // Always add gain and limiter to the effect chain
-        effectChain.add(new CustomGain(1.8f)); // Adjust gain as needed
-        effectChain.add(new CustomLimiter(0.9f)); // Adjust limiter threshold as needed
+        effectChain.add(new CustomGain(1.7f)); // Adjust gain as needed
+        effectChain.add(new CustomLimiter(0.8f)); // Adjust limiter threshold as needed
         return effectChain;
     }
 
