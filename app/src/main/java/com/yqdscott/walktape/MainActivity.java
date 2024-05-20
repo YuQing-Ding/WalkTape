@@ -446,26 +446,29 @@ public class MainActivity extends AppCompatActivity {
         List<AudioProcessor> effectChain = new ArrayList<>();
         switch (type) {
             case TYPE_A:
-                effectChain.add(new CustomWowFlutter(0.006f, 0.004f));
-                effectChain.add(new CustomNoise(0.2f));
-                effectChain.add(new CustomDistortion(1.5f));
-                effectChain.add(new CustomTapeHiss(0.00015f));
+                effectChain.add(new CustomWowFlutter(1.0f, 0.0219f)); // 1 Hz 的 Wow 效果，深度为 0.219%
+                effectChain.add(new CustomWowFlutter(4.0f, 0.0219f)); // 6 Hz 的 Flutter 效果，深度为 0.219%
+                effectChain.add(new CustomNoise(0.15f));
+                effectChain.add(new CustomDistortion(1.8f));
+                effectChain.add(new CustomSuperBass(0.6f,150f));
                 break;
             case TYPE_B://模拟TPS-L2 （暂时）
-                effectChain.add(new CustomNoise(0.2f)); // 背景噪音
-                effectChain.add(new CustomDistortion(0.5f)); // 适中的失真水平
-                effectChain.add(new CustomTapeHiss(0.0004f)); // 低水平的磁带嘶嘶声
-                effectChain.add(new CustomWowFlutter(1.0f, 0.00219f)); // 1 Hz 的 Wow 效果，深度为 0.219%
-                effectChain.add(new CustomWowFlutter(6.0f, 0.00219f)); // 6 Hz 的 Flutter 效果，深度为 0.219%
+                effectChain.add(new CustomWowFlutter(0.01f, 0.219f)); // 1 Hz 的 Wow 效果，深度为 0.219%
+                effectChain.add(new CustomWowFlutter(0.06f, 0.219f)); // 6 Hz 的 Flutter 效果，深度为 0.219%
+                effectChain.add(new CustomNoise(0.18f)); // 背景噪音
+                effectChain.add(new CustomDistortion(0.6f)); // 适中的失真水平
+                effectChain.add(new CustomTapeHiss(0.003f)); // 低水平的磁带嘶嘶声
                 effectChain.add(new CustomTapeSqueal(0.01f, 0.136f)); // 磁带尖叫声，高频噪音
+                effectChain.add(new CustomSuperBass(0.5f,150f));
                 break;
             case TYPE_C:
-                effectChain.add(new CustomNoise(0.2f));
-                effectChain.add(new CustomDistortion(0.95f));
-                effectChain.add(new CustomTapeHiss(0.0004f));
-                effectChain.add(new CustomWowFlutter(1.0f, 0.01f)); // Wow 效果
-                effectChain.add(new CustomWowFlutter(6.0f, 0.00219f)); // Flutter 效果
-                effectChain.add(new CustomTapeSqueal(0.01f, 0.136f));
+                effectChain.add(new CustomWowFlutter(4.0f, 0.219f)); // 1 Hz 的 Wow 效果，深度为 0.219%
+                effectChain.add(new CustomWowFlutter(8.0f, 0.219f)); // 6 Hz 的 Flutter 效果，深度为 0.219%
+                effectChain.add(new CustomNoise(0.5f)); // 背景噪音
+                effectChain.add(new CustomDistortion(0.4f)); // 适中的失真水平
+                effectChain.add(new CustomTapeHiss(0.008f)); // 低水平的磁带嘶嘶声
+                effectChain.add(new CustomTapeSqueal(0.02f, 0.136f)); // 磁带尖叫声，高频噪音
+                effectChain.add(new CustomSuperBass(0.8f,150f));
                 break;
         }
         // Always add gain and limiter to the effect chain
