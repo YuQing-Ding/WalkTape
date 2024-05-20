@@ -453,11 +453,12 @@ public class MainActivity extends AppCompatActivity {
                 break;
             case TYPE_B:
                 effectChain.add(new CustomNoise(0.2f)); // Amount for general background noise
-                effectChain.add(new CustomDistortion(0.35f)); // Distortion to match the TPS-L2 spec
+                effectChain.add(new CustomDistortion(0.38f)); // Distortion to match the TPS-L2 spec
                 effectChain.add(new CustomTapeHiss(0.0004f)); // Tape hiss, kept at a low level
                 effectChain.add(new CustomWowFlutter(1.0f, 0.00219f)); // Wow effect with a 1 Hz rate, 0.219% depth
                 effectChain.add(new CustomWowFlutter(6.0f, 0.00219f)); // Flutter effect with a 6 Hz rate, 0.219% depth
                 effectChain.add(new CustomTapeSqueal(0.01f, 0.136f)); // Tape squeal for high-frequency artifacts
+                effectChain.add(new CustomDropout(0.0005f)); // dropout
                 break;
             case TYPE_C:
                 effectChain.add(new CustomNoise(0.2f));
