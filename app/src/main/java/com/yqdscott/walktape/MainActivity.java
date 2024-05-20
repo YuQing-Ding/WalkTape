@@ -110,7 +110,7 @@ public class MainActivity extends AppCompatActivity {
                 currentEffectChain = getEffectChain(EffectType.TYPE_C);
             }
             // Always add gain and limiter to the effect chain
-            currentEffectChain.add(new CustomGain(1.7f)); // Adjust gain as needed
+            currentEffectChain.add(new CustomGain(1.6f)); // Adjust gain as needed
             currentEffectChain.add(new CustomLimiter(0.8f));
         });
 
@@ -118,7 +118,7 @@ public class MainActivity extends AppCompatActivity {
         defaultEffect.setChecked(true);
         currentEffectChain = getEffectChain(EffectType.TYPE_A);
         // Always add gain and limiter to the effect chain
-        currentEffectChain.add(new CustomGain(1.7f)); // Adjust gain as needed
+        currentEffectChain.add(new CustomGain(1.6f)); // Adjust gain as needed
         currentEffectChain.add(new CustomLimiter(0.8f)); // Adjust limiter threshold as needed
 
         progressBar = findViewById(R.id.progress_bar);
@@ -451,14 +451,13 @@ public class MainActivity extends AppCompatActivity {
                 effectChain.add(new CustomDistortion(1.5f));
                 effectChain.add(new CustomTapeHiss(0.00015f));
                 break;
-            case TYPE_B:
-                effectChain.add(new CustomNoise(0.2f)); // Amount for general background noise
-                effectChain.add(new CustomDistortion(0.38f)); // Distortion to match the TPS-L2 spec
-                effectChain.add(new CustomTapeHiss(0.0004f)); // Tape hiss, kept at a low level
-                effectChain.add(new CustomWowFlutter(1.0f, 0.00219f)); // Wow effect with a 1 Hz rate, 0.219% depth
-                effectChain.add(new CustomWowFlutter(6.0f, 0.00219f)); // Flutter effect with a 6 Hz rate, 0.219% depth
-                effectChain.add(new CustomTapeSqueal(0.01f, 0.136f)); // Tape squeal for high-frequency artifacts
-                effectChain.add(new CustomDropout(0.0005f)); // dropout
+            case TYPE_B://模拟TPS-L2 （暂时）
+                effectChain.add(new CustomNoise(0.2f)); // 背景噪音
+                effectChain.add(new CustomDistortion(0.5f)); // 适中的失真水平
+                effectChain.add(new CustomTapeHiss(0.0004f)); // 低水平的磁带嘶嘶声
+                effectChain.add(new CustomWowFlutter(1.0f, 0.00219f)); // 1 Hz 的 Wow 效果，深度为 0.219%
+                effectChain.add(new CustomWowFlutter(6.0f, 0.00219f)); // 6 Hz 的 Flutter 效果，深度为 0.219%
+                effectChain.add(new CustomTapeSqueal(0.01f, 0.136f)); // 磁带尖叫声，高频噪音
                 break;
             case TYPE_C:
                 effectChain.add(new CustomNoise(0.2f));
@@ -470,7 +469,7 @@ public class MainActivity extends AppCompatActivity {
                 break;
         }
         // Always add gain and limiter to the effect chain
-        effectChain.add(new CustomGain(1.7f)); // Adjust gain as needed
+        effectChain.add(new CustomGain(1.6f)); // Adjust gain as needed
         effectChain.add(new CustomLimiter(0.8f)); // Adjust limiter threshold as needed
         return effectChain;
     }
