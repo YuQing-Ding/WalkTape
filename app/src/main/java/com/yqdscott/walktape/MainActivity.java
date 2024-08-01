@@ -243,8 +243,8 @@ public class MainActivity extends AppCompatActivity {
 
                 audioTrack = new AudioTrack(
                         AudioManager.STREAM_MUSIC,
-                        22050, // 目标采样率
-                        AudioFormat.CHANNEL_OUT_MONO, // 单声道
+                        22050, // Target Sample Rate
+                        AudioFormat.CHANNEL_OUT_MONO, // Mono
                         audioFormat,
                         minBufferSize,
                         AudioTrack.MODE_STREAM
@@ -262,7 +262,7 @@ public class MainActivity extends AppCompatActivity {
                 RateTransposer rateTransposer = new RateTransposer((float) 22050 / sampleRate);
                 TarsosDSPAudioFloatConverter converter = TarsosDSPAudioFloatConverter.getConverter(tarsosFormat);
 
-                // 添加短暂延迟，确保 AudioTrack 初始化完成
+                // Add a short delay to ensure that AudioTrack initialization is complete
                 Thread.sleep(500);
 
                 while (!Thread.interrupted() && !isEOS) {
@@ -309,7 +309,7 @@ public class MainActivity extends AppCompatActivity {
                                 outBuffer.get(chunk);
                                 outBuffer.clear();
 
-                                // 转换到浮点数
+                                // Convert to Floating Point
                                 short[] shortBuffer = new short[chunk.length / 2];
                                 ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shortBuffer);
                                 float[] floatBuffer = new float[shortBuffer.length];
@@ -317,7 +317,7 @@ public class MainActivity extends AppCompatActivity {
                                     floatBuffer[i] = shortBuffer[i] / (float) Short.MAX_VALUE;
                                 }
 
-                                // 立体声转单声道
+                                // Stereo to Mono
                                 if (channelCount == 2) {
                                     float[] monoBuffer = new float[floatBuffer.length / 2];
                                     for (int i = 0; i < monoBuffer.length; i++) {
@@ -326,24 +326,24 @@ public class MainActivity extends AppCompatActivity {
                                     floatBuffer = monoBuffer;
                                 }
 
-                                // 重采样
+                                // resample
                                 AudioEvent audioEvent = new AudioEvent(targetFormat);
                                 audioEvent.setFloatBuffer(floatBuffer);
                                 rateTransposer.process(audioEvent);
 
-                                // 应用效果链
+                                // Applied Effects Chain
                                 for (AudioProcessor processor : currentEffectChain) {
                                     processor.process(audioEvent);
                                 }
 
-                                // 转换回短整型
+                                // Convert back to short integer
                                 floatBuffer = audioEvent.getFloatBuffer();
                                 shortBuffer = new short[floatBuffer.length];
                                 for (int i = 0; i < floatBuffer.length; i++) {
                                     shortBuffer[i] = (short) (floatBuffer[i] * Short.MAX_VALUE);
                                 }
 
-                                // 写入音轨
+                                // Write to audio track
                                 audioTrack.write(shortBuffer, 0, shortBuffer.length);
                             }
                             codec.releaseOutputBuffer(outIndex, false);
@@ -446,28 +446,28 @@ public class MainActivity extends AppCompatActivity {
         List<AudioProcessor> effectChain = new ArrayList<>();
         switch (type) {
             case TYPE_A:
-                effectChain.add(new CustomWowFlutter(1.0f, 0.0219f)); // 1 Hz 的 Wow 效果，深度为 0.219%
-                effectChain.add(new CustomWowFlutter(4.0f, 0.0219f)); // 6 Hz 的 Flutter 效果，深度为 0.219%
+                effectChain.add(new CustomWowFlutter(1.0f, 0.0219f)); 
+                effectChain.add(new CustomWowFlutter(4.0f, 0.0219f)); 
                 effectChain.add(new CustomNoise(0.15f));
                 effectChain.add(new CustomDistortion(1.8f));
                 effectChain.add(new CustomSuperBass(0.6f,150f));
                 break;
-            case TYPE_B://模拟TPS-L2 （暂时）
-                effectChain.add(new CustomWowFlutter(0.1f, 0.00219f)); // 1 Hz 的 Wow 效果，深度为 0.219%
-                effectChain.add(new CustomWowFlutter(0.4f, 0.00219f)); // 6 Hz 的 Flutter 效果，深度为 0.219%
-                effectChain.add(new CustomNoise(0.45f)); // 背景噪音
-                effectChain.add(new CustomDistortion(0.5f)); // 适中的失真水平
-                effectChain.add(new CustomTapeHiss(0.003f)); // 低水平的磁带嘶嘶声
-                effectChain.add(new CustomTapeSqueal(0.01f, 0.136f)); // 磁带尖叫声，高频噪音
+            case TYPE_B://Emulates Sony TPS-L2 sound (for now)
+                effectChain.add(new CustomWowFlutter(0.1f, 0.00219f)); 
+                effectChain.add(new CustomWowFlutter(0.4f, 0.00219f)); 
+                effectChain.add(new CustomNoise(0.45f));
+                effectChain.add(new CustomDistortion(0.5f));
+                effectChain.add(new CustomTapeHiss(0.003f));
+                effectChain.add(new CustomTapeSqueal(0.01f, 0.136f)); 
                 effectChain.add(new CustomSuperBass(0.5f,150f));
                 break;
             case TYPE_C:
-                effectChain.add(new CustomWowFlutter(4.0f, 0.219f)); // 1 Hz 的 Wow 效果，深度为 0.219%
-                effectChain.add(new CustomWowFlutter(8.0f, 0.219f)); // 6 Hz 的 Flutter 效果，深度为 0.219%
-                effectChain.add(new CustomNoise(0.5f)); // 背景噪音
-                effectChain.add(new CustomDistortion(0.4f)); // 适中的失真水平
-                effectChain.add(new CustomTapeHiss(0.008f)); // 低水平的磁带嘶嘶声
-                effectChain.add(new CustomTapeSqueal(0.02f, 0.136f)); // 磁带尖叫声，高频噪音
+                effectChain.add(new CustomWowFlutter(4.0f, 0.219f));
+                effectChain.add(new CustomWowFlutter(8.0f, 0.219f));
+                effectChain.add(new CustomNoise(0.5f));
+                effectChain.add(new CustomDistortion(0.4f));
+                effectChain.add(new CustomTapeHiss(0.008f));
+                effectChain.add(new CustomTapeSqueal(0.02f, 0.136f));
                 effectChain.add(new CustomSuperBass(0.8f,150f));
                 break;
         }
