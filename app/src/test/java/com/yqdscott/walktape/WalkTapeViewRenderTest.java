@@ -238,6 +238,29 @@ public class WalkTapeViewRenderTest {
     }
 
     @Test
+    public void completionAdvancesWithinAlbumThenStopsAtItsLastTrack() {
+        MiniPlayerListener listener = new MiniPlayerListener();
+        view.setListener(listener);
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+        tap(210, 610);
+        settleAndRender(1080, 2160);
+        tap(790, 560);
+        settleAndRender(1080, 2160);
+        tap(300, 1100);
+
+        assertEquals(601L, view.getNowPlayingTrack().id);
+        assertTrue(view.advanceAfterCompletion());
+        assertEquals(602L, view.getNowPlayingTrack().id);
+        assertTrue(view.advanceAfterCompletion());
+        assertEquals(603L, view.getNowPlayingTrack().id);
+        assertTrue("Album completion must not wrap to its first track",
+                !view.advanceAfterCompletion());
+        assertEquals(603L, view.getNowPlayingTrack().id);
+        assertEquals(2, listener.skips);
+    }
+
+    @Test
     public void playerInfoCardFlipsToAlbumTracksAndSelectionFlipsItBack() throws IOException {
         MiniPlayerListener listener = new MiniPlayerListener();
         view.setListener(listener);

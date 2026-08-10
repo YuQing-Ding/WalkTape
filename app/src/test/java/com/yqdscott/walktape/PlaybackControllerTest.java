@@ -93,6 +93,66 @@ public class PlaybackControllerTest {
                 rms(ultrasonicOutput, ultrasonicFrames, 100) < 0.025);
     }
 
+    @Test
+    public void fusedPacked24DecimatorIsSampleIdenticalToTheReferencePath() {
+        final int inputRate = 192_000;
+        final int outputRate = 48_000;
+        final int inputFrames = 2_037;
+        byte[] packed = new byte[inputFrames * 2 * 3];
+        float[] unpacked = new float[inputFrames * 2];
+        int state = 0x13579bdf;
+        for (int sample = 0; sample < unpacked.length; sample++) {
+            state = state * 1_664_525 + 1_013_904_223;
+            int value = state >> 8;
+            int offset = sample * 3;
+            packed[offset] = (byte) value;
+            packed[offset + 1] = (byte) (value >>> 8);
+            packed[offset + 2] = (byte) (value >>> 16);
+            unpacked[sample] = value / 8_388_608f;
+        }
+
+        PlaybackController.PcmRateConverter reference =
+                new PlaybackController.PcmRateConverter(inputRate, outputRate);
+        PlaybackController.PcmRateConverter fused =
+                new PlaybackController.PcmRateConverter(inputRate, outputRate);
+        float[] expected = new float[reference.maximumOutputFrames(inputFrames) * 2];
+        float[] actual = new float[fused.maximumOutputFrames(inputFrames) * 2];
+
+        int expectedFrames = reference.process(unpacked, inputFrames, expected);
+        int actualFrames = fused.processPcm24(packed, 0, inputFrames, 2, actual);
+
+        assertEquals(expectedFrames, actualFrames);
+        assertArrayEquals(expected, actual, 0f);
+    }
+
+    @Test
+    public void fusedPcm16DecimatorIsSampleIdenticalToTheReferencePath() {
+        final int inputRate = 192_000;
+        final int outputRate = 48_000;
+        final int inputFrames = 4_099;
+        short[] pcm = new short[inputFrames * 2];
+        float[] unpacked = new float[inputFrames * 2];
+        int state = 0x2468ace1;
+        for (int sample = 0; sample < unpacked.length; sample++) {
+            state = state * 1_103_515_245 + 12_345;
+            pcm[sample] = (short) (state >>> 16);
+            unpacked[sample] = pcm[sample] / 32_768f;
+        }
+
+        PlaybackController.PcmRateConverter reference =
+                new PlaybackController.PcmRateConverter(inputRate, outputRate);
+        PlaybackController.PcmRateConverter fused =
+                new PlaybackController.PcmRateConverter(inputRate, outputRate);
+        float[] expected = new float[reference.maximumOutputFrames(inputFrames) * 2];
+        float[] actual = new float[fused.maximumOutputFrames(inputFrames) * 2];
+
+        int expectedFrames = reference.process(unpacked, inputFrames, expected);
+        int actualFrames = fused.processPcm16(pcm, 0, inputFrames, 2, actual);
+
+        assertEquals(expectedFrames, actualFrames);
+        assertArrayEquals(expected, actual, 0f);
+    }
+
     private static float[] stereoSine(int sampleRate,
                                       int frameCount,
                                       float frequency,

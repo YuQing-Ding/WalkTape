@@ -417,11 +417,22 @@ public class PlaybackDeviceTest {
             assertTrue("Screen-off playback did not create an AudioTrack", output != null);
             int underrunsBeforeSleep = output.getUnderrunCount();
             long positionBeforeSleep = controller.getPositionMs();
-            long target = Math.min(durationMs - 1_000L, positionBeforeSleep + 12_000L);
+            long screenOffRunMs = 12_000L;
+            String sustainArgument = InstrumentationRegistry.getArguments().getString(
+                    "sustainMs");
+            if (sustainArgument != null) {
+                try {
+                    screenOffRunMs = Math.max(6_000L, Long.parseLong(sustainArgument));
+                } catch (NumberFormatException ignored) {
+                    // Keep the normal regression duration for malformed optional arguments.
+                }
+            }
+            long target = Math.min(durationMs - 1_000L,
+                    positionBeforeSleep + screenOffRunMs);
             Assume.assumeTrue(target > positionBeforeSleep + 5_000L);
 
             executeShell(instrumentation, "input keyevent 223");
-            waitForPosition(controller, target, noError, 20_000L);
+            waitForPosition(controller, target, noError, screenOffRunMs + 8_000L);
             assertNull(noError.get(), noError.get());
             assertTrue("Audio clock stalled after the display powered off: before="
                             + positionBeforeSleep + " after=" + controller.getPositionMs(),

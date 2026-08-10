@@ -88,6 +88,24 @@ public class TpsL2DspTest {
     }
 
     @Test
+    public void settledOutputCarriesTheCalibratedPitchFlutter() {
+        TpsL2Dsp renderer = new TpsL2Dsp(SAMPLE_RATE, 1980L,
+                true, false, false);
+        float[] tone = sine(1_000f, 0.08f, SAMPLE_RATE * 36);
+
+        renderer.process(tone, SAMPLE_RATE * 36);
+
+        double measuredFraction = pitchFlutterRms(tone, 0, 1_000f,
+                SAMPLE_RATE * 20, SAMPLE_RATE * 16);
+        double targetFraction = TpsL2Dsp.nominalWowFlutterRmsPercent() / 100.0;
+        assertEquals("Actual PCM pitch motion must match the encoded TPS-L2 calibration",
+                targetFraction, measuredFraction, 0.00035);
+        double approximateCentsRms = measuredFraction * 1_200.0 / Math.log(2.0);
+        assertTrue("Piano sustain should contain more than three cents RMS of pitch motion",
+                approximateCentsRms > 3.0);
+    }
+
+    @Test
     public void integratedNoDolbyHissIsStrongerThanTheSpectralReferenceLine() {
         TpsL2Dsp renderer = new TpsL2Dsp(SAMPLE_RATE, 42L,
                 false, true, false);
@@ -271,6 +289,38 @@ public class TpsL2DspTest {
             previous = current;
         }
         return (crossings - 1) * SAMPLE_RATE / (lastCrossing - firstCrossing);
+    }
+
+    private static double pitchFlutterRms(float[] stereo,
+                                          int channel,
+                                          float toneFrequency,
+                                          int startFrame,
+                                          int windowFrames) {
+        int end = Math.min(stereo.length / 2, startFrame + windowFrames);
+        double nominalPeriod = SAMPLE_RATE / toneFrequency;
+        double previousCrossing = Double.NaN;
+        double mean = 0.0;
+        double squaredDeviations = 0.0;
+        int periods = 0;
+        float previous = stereo[startFrame * 2 + channel];
+        for (int frame = startFrame + 1; frame < end; frame++) {
+            float current = stereo[frame * 2 + channel];
+            if (previous <= 0f && current > 0f) {
+                double fraction = -previous / (current - previous);
+                double crossing = frame - 1 + fraction;
+                if (!Double.isNaN(previousCrossing)) {
+                    double period = crossing - previousCrossing;
+                    double pitchError = nominalPeriod / period - 1.0;
+                    periods++;
+                    double delta = pitchError - mean;
+                    mean += delta / periods;
+                    squaredDeviations += delta * (pitchError - mean);
+                }
+                previousCrossing = crossing;
+            }
+            previous = current;
+        }
+        return Math.sqrt(squaredDeviations / Math.max(1, periods));
     }
 
     private static double decibels(double powerRatio) {

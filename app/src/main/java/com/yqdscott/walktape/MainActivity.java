@@ -383,6 +383,9 @@ public class MainActivity extends AppCompatActivity implements
 
     @Override
     public void onCompleted() {
+        if (walkTapeView.advanceAfterCompletion()) {
+            return;
+        }
         PlaybackKeepAliveService.stop(this);
         walkTapeView.setPlaying(false);
         long duration = Math.max(1, playbackController.getDurationMs());

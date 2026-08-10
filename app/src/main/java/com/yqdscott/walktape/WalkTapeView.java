@@ -601,6 +601,17 @@ public final class WalkTapeView extends View {
         return nowPlayingAlbum;
     }
 
+    /** Advances within the current album without wrapping its final track back to side A. */
+    boolean advanceAfterCompletion() {
+        if (nowPlayingAlbum == null || nowPlayingAlbum.tracks.isEmpty()
+                || nowPlayingTrackIndex < 0
+                || nowPlayingTrackIndex + 1 >= nowPlayingAlbum.tracks.size()) {
+            return false;
+        }
+        skipTrack(1);
+        return true;
+    }
+
     public boolean isPlayerScene() {
         return scene == Scene.PLAYER;
     }

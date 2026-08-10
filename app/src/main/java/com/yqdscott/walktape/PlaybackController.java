@@ -34,8 +34,11 @@ public final class PlaybackController {
     // Public AudioFormat values added after our minSdk; numeric constants keep old devices safe.
     private static final int PCM_24_BIT_PACKED = 21;
     private static final int PCM_32_BIT = 22;
-    private static final int AUDIO_PRIME_MS = 300;
-    private static final int AUDIO_BUFFER_MS = 1_000;
+    private static final int AUDIO_PRIME_MS = 450;
+    private static final int AUDIO_BUFFER_MS = 2_000;
+    private static final int PCM_QUEUE_MS = 2_000;
+    private static final int AUDIO_WRITE_FRAMES = 2_048;
+    private static final long AUDIO_WRITER_JOIN_MS = 2_000L;
 
     public enum HotlineResult {
         STARTED,
@@ -288,6 +291,7 @@ public final class PlaybackController {
         private volatile float sessionDucking = 1f;
         private volatile boolean sessionHighTape;
         private volatile AudioTrack audioTrack;
+        private volatile PcmWriter pcmWriter;
         private volatile TpsL2Dsp dsp;
         private volatile boolean outputStarted;
 
@@ -436,6 +440,14 @@ public final class PlaybackController {
                 playbackAnchorSet = false;
                 stereoFramesWritten = 0L;
 
+                PcmWriter writer = pcmWriter;
+                if (writer != null) {
+                    // Invalidate both queued PCM and any block currently crossing into AudioTrack.
+                    // resetAfterSeek() clears once more after the extractor/codec has moved, which
+                    // closes the tiny race where a completed DSP block observes the first flush.
+                    writer.flushForSeek();
+                }
+
                 // AudioTrack.write() is blocking and otherwise cannot observe the pending seek
                 // until the old buffer has played. Pause/flush makes that write return now; the
                 // decoder thread performs the actual seek and restarts from the new timestamp.
@@ -476,6 +488,10 @@ public final class PlaybackController {
         void requestStop() {
             stopRequested = true;
             interrupt();
+            PcmWriter writer = pcmWriter;
+            if (writer != null) {
+                writer.requestStop();
+            }
             synchronized (controlLock) {
                 controlLock.notifyAll();
             }
@@ -798,25 +814,12 @@ public final class PlaybackController {
             if (minimum <= 0) {
                 throw new PlaybackFailure("设备无法建立 " + renderSampleRate + " Hz 音频输出");
             }
-            // Keep enough room to prime before play(). The former expression only allocated
-            // 200 ms of stereo-float PCM, so a 300 ms prime could block forever inside write().
-            // A one-second queue absorbs bursty 24-bit software decoding and high-resolution
-            // resampling while the 300 ms start threshold still bounds perceived seek latency.
+            // AudioTrack is the final hardware-facing reserve. A separate Java PCM ring below
+            // lets decoding/DSP run ahead without making the time-critical writer wait for a
+            // MediaCodec, ALAC packet, GC pause or a 192 kHz resampling burst.
             int bufferBytes = Math.max(minimum * 2,
                     renderSampleRate * 2 * Float.BYTES * AUDIO_BUFFER_MS / 1_000);
-            AudioTrack output = new AudioTrack.Builder()
-                    .setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build())
-                    .setAudioFormat(new AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                            .setSampleRate(renderSampleRate)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                            .build())
-                    .setBufferSizeInBytes(bufferBytes)
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build();
+            AudioTrack output = buildAudioTrack(renderSampleRate, bufferBytes);
             if (output.getState() != AudioTrack.STATE_INITIALIZED) {
                 output.release();
                 throw new PlaybackFailure("AudioTrack 初始化失败");
@@ -834,11 +837,34 @@ public final class PlaybackController {
             audioTrack = output;
             outputStarted = false;
             output.setVolume(sessionDucking);
+            PcmWriter writer = new PcmWriter(output, renderSampleRate);
+            pcmWriter = writer;
+            writer.start();
             prepared = true;
             if (!preparedCallbackSent) {
                 preparedCallbackSent = true;
                 postPrepared(this, durationMs);
             }
+        }
+
+        private AudioTrack buildAudioTrack(int sampleRate,
+                                           int bufferBytes) {
+            // Do not request PERFORMANCE_MODE_POWER_SAVING here. Pixel routes that request to a
+            // deep-buffer path and down-clocks the CPU aggressively enough that a sustained
+            // 192 kHz source can outrun this realtime TPS-L2 renderer after thermal settling.
+            return new AudioTrack.Builder()
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build())
+                    .setAudioFormat(new AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                            .build())
+                    .setBufferSizeInBytes(bufferBytes)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build();
         }
 
         private void writePcm(ByteBuffer source,
@@ -888,6 +914,24 @@ public final class PlaybackController {
                 }
                 ShortBuffer shortView = pcm.slice().order(ByteOrder.nativeOrder()).asShortBuffer();
                 shortView.get(pcm16Buffer, 0, inputSamples);
+                PcmRateConverter converter = rateConverter;
+                if (converter != null) {
+                    int maximumFrames = converter.maximumOutputFrames(sourceFrames);
+                    int maximumSamples = maximumFrames * 2;
+                    if (resampledBuffer.length < maximumSamples) {
+                        resampledBuffer = new float[Math.max(maximumSamples,
+                                resampledBuffer.length * 2 + 2048)];
+                    }
+                    int renderFrames = converter.processPcm16(
+                            pcm16Buffer, 0, sourceFrames, channels, resampledBuffer);
+                    long firstAudibleUs = presentationUs
+                            + framesToSkip * 1_000_000L / inputSampleRate;
+                    discardBeforeUs = NO_SEEK;
+                    if (renderFrames > 0) {
+                        renderTapePcm(resampledBuffer, renderFrames, firstAudibleUs);
+                    }
+                    return;
+                }
                 int sourceIndex = 0;
                 int destination = 0;
                 for (int frame = 0; frame < sourceFrames; frame++) {
@@ -930,6 +974,24 @@ public final class PlaybackController {
                             pcm24Buffer.length * 2 + 4096)];
                 }
                 pcm.get(pcm24Buffer, 0, byteCount);
+                PcmRateConverter converter = rateConverter;
+                if (converter != null) {
+                    int maximumFrames = converter.maximumOutputFrames(sourceFrames);
+                    int maximumSamples = maximumFrames * 2;
+                    if (resampledBuffer.length < maximumSamples) {
+                        resampledBuffer = new float[Math.max(maximumSamples,
+                                resampledBuffer.length * 2 + 2048)];
+                    }
+                    int renderFrames = converter.processPcm24(
+                            pcm24Buffer, 0, sourceFrames, channels, resampledBuffer);
+                    long firstAudibleUs = presentationUs
+                            + framesToSkip * 1_000_000L / inputSampleRate;
+                    discardBeforeUs = NO_SEEK;
+                    if (renderFrames > 0) {
+                        renderTapePcm(resampledBuffer, renderFrames, firstAudibleUs);
+                    }
+                    return;
+                }
                 int sourceIndex = 0;
                 int destination = 0;
                 for (int frame = 0; frame < sourceFrames; frame++) {
@@ -1019,6 +1081,12 @@ public final class PlaybackController {
                 }
                 renderBuffer = resampledBuffer;
             }
+            renderTapePcm(renderBuffer, renderFrames, firstAudibleUs);
+        }
+
+        private void renderTapePcm(float[] renderBuffer,
+                                   int renderFrames,
+                                   long firstAudibleUs) throws Exception {
             int requiredSamples = renderFrames * 2;
             TpsL2Dsp renderer = dsp;
             if (renderer == null) {
@@ -1053,55 +1121,22 @@ public final class PlaybackController {
 
         private void writeStereoFloat(float[] samples, int sampleCount, long presentationUs)
                 throws Exception {
-            AudioTrack output = audioTrack;
-            if (output == null) {
+            PcmWriter writer = pcmWriter;
+            if (writer == null) {
                 throw new PlaybackFailure("音频输出已关闭");
             }
-            if (!playbackAnchorSet) {
-                playbackAnchorFrames = Integer.toUnsignedLong(output.getPlaybackHeadPosition());
-                mediaAnchorUs = Math.max(0, presentationUs);
-                playbackAnchorSet = true;
-                stereoFramesWritten = 0;
-            }
-
-            int written = 0;
-            while (written < sampleCount && !stopRequested) {
-                waitWhilePaused();
-                if (stopRequested || hasPendingSeek()) {
-                    return;
-                }
-                int result = output.write(samples, written, sampleCount - written,
-                        AudioTrack.WRITE_BLOCKING);
-                if (result < 0) {
-                    if (stopRequested || hasPendingSeek()) {
-                        return;
-                    }
-                    throw new PlaybackFailure("AudioTrack 写入失败：" + result);
-                }
-                if (result == 0) {
-                    Thread.yield();
-                    continue;
-                }
-                written += result;
-                stereoFramesWritten += result / 2L;
-                if (!outputStarted) {
-                    synchronized (controlLock) {
-                        // Prime a short transport reserve before play(). One tiny decoder block is
-                        // not enough for high-resolution FLAC and causes a sawtooth of underruns.
-                        long primeFrames = outputSampleRate * AUDIO_PRIME_MS / 1_000L;
-                        if (!outputStarted && !paused && pendingSeekUs == NO_SEEK
-                                && !stopRequested && stereoFramesWritten >= primeFrames) {
-                            output.play();
-                            outputStarted = true;
-                        }
-                    }
-                }
+            if (!writer.enqueue(samples, sampleCount, presentationUs)) {
+                return;
             }
             fallbackPositionMs = Math.max(0, presentationUs / 1_000L);
         }
 
         /** @return true after drain, false when a seek should restart decoding. */
-        private boolean waitForAudioDrain() throws InterruptedException {
+        private boolean waitForAudioDrain() throws InterruptedException, PlaybackFailure {
+            PcmWriter writer = pcmWriter;
+            if (writer != null && !writer.finishInputAndAwaitDrained()) {
+                return false;
+            }
             AudioTrack output = audioTrack;
             if (output == null || !playbackAnchorSet) {
                 return true;
@@ -1151,6 +1186,12 @@ public final class PlaybackController {
         }
 
         private void resetAfterSeek(long seekUs) {
+            PcmWriter writer = pcmWriter;
+            if (writer != null) {
+                // seekTo() clears immediately for responsive scrubbing. Clear once more after the
+                // extractor/codec has moved so an already-running DSP block cannot leak across it.
+                writer.flushForSeek();
+            }
             discardBeforeUs = seekUs;
             playbackAnchorSet = false;
             stereoFramesWritten = 0;
@@ -1175,6 +1216,265 @@ public final class PlaybackController {
                     } catch (IllegalStateException ignored) {
                         // A subsequent write reports a real output failure if necessary.
                     }
+                }
+            }
+        }
+
+        /**
+         * The decoder/DSP producer and the hardware writer deliberately run independently. A
+         * MediaCodec, ALAC, resampler or GC burst can now consume the Java reserve without ever
+         * making AudioTrack wait for that work on its time-critical thread.
+         */
+        private final class PcmWriter extends Thread {
+            private final AudioTrack output;
+            private final Object queueLock = new Object();
+            private final float[] ring;
+            private final float[] writeBuffer = new float[AUDIO_WRITE_FRAMES * 2];
+
+            private int readIndex;
+            private int writeIndex;
+            private int queuedSamples;
+            private int inFlightSamples;
+            private volatile int generation;
+            private boolean anchorPending;
+            private long anchorUs;
+            private volatile boolean stopped;
+            private PlaybackFailure failure;
+
+            PcmWriter(AudioTrack output, int sampleRate) {
+                super("WalkTape audio writer");
+                this.output = output;
+                int queueSamples = Math.max(writeBuffer.length * 4,
+                        sampleRate * 2 * PCM_QUEUE_MS / 1_000);
+                ring = new float[queueSamples & ~1];
+            }
+
+            boolean enqueue(float[] source, int requestedSamples, long presentationUs)
+                    throws InterruptedException, PlaybackFailure {
+                int sampleCount = Math.min(source.length, requestedSamples) & ~1;
+                if (sampleCount <= 0) {
+                    return true;
+                }
+
+                int copied = 0;
+                int expectedGeneration;
+                synchronized (queueLock) {
+                    expectedGeneration = generation;
+                    while (copied < sampleCount) {
+                        throwIfFailedLocked();
+                        while (queuedSamples == ring.length
+                                && expectedGeneration == generation
+                                && !stopped && !stopRequested) {
+                            queueLock.wait();
+                            throwIfFailedLocked();
+                        }
+                        if (stopped || stopRequested || expectedGeneration != generation) {
+                            return false;
+                        }
+                        if (copied == 0 && queuedSamples == 0 && inFlightSamples == 0
+                                && !anchorPending && !playbackAnchorSet) {
+                            anchorPending = true;
+                            anchorUs = Math.max(0L, presentationUs);
+                        }
+
+                        int available = ring.length - queuedSamples;
+                        int contiguous = ring.length - writeIndex;
+                        int amount = Math.min(sampleCount - copied,
+                                Math.min(available, contiguous));
+                        System.arraycopy(source, copied, ring, writeIndex, amount);
+                        copied += amount;
+                        writeIndex = (writeIndex + amount) % ring.length;
+                        queuedSamples += amount;
+                        queueLock.notifyAll();
+                    }
+                }
+                return true;
+            }
+
+            void flushForSeek() {
+                synchronized (queueLock) {
+                    generation++;
+                    readIndex = 0;
+                    writeIndex = 0;
+                    queuedSamples = 0;
+                    inFlightSamples = 0;
+                    anchorPending = false;
+                    queueLock.notifyAll();
+                }
+            }
+
+            boolean finishInputAndAwaitDrained()
+                    throws InterruptedException, PlaybackFailure {
+                synchronized (queueLock) {
+                    int expectedGeneration = generation;
+                    throwIfFailedLocked();
+                    while ((queuedSamples > 0 || inFlightSamples > 0)
+                            && expectedGeneration == generation
+                            && !stopped && !stopRequested) {
+                        queueLock.wait();
+                        throwIfFailedLocked();
+                    }
+                    throwIfFailedLocked();
+                    return expectedGeneration == generation && !stopped && !stopRequested;
+                }
+            }
+
+            void requestStop() {
+                synchronized (queueLock) {
+                    stopped = true;
+                    generation++;
+                    readIndex = 0;
+                    writeIndex = 0;
+                    queuedSamples = 0;
+                    inFlightSamples = 0;
+                    anchorPending = false;
+                    queueLock.notifyAll();
+                }
+                interrupt();
+            }
+
+            void awaitStop(long timeoutMs) {
+                long deadline = System.currentTimeMillis() + Math.max(0L, timeoutMs);
+                boolean interrupted = false;
+                while (isAlive()) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0L) {
+                        break;
+                    }
+                    try {
+                        join(remaining);
+                    } catch (InterruptedException ignored) {
+                        interrupted = true;
+                    }
+                }
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            @Override
+            public void run() {
+                try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+                    while (!stopped && !stopRequested) {
+                        int samples;
+                        int blockGeneration;
+                        boolean ownsAnchor;
+                        long blockAnchorUs;
+                        synchronized (queueLock) {
+                            while (queuedSamples == 0 && !stopped && !stopRequested) {
+                                queueLock.wait();
+                            }
+                            if (stopped || stopRequested) {
+                                return;
+                            }
+                            blockGeneration = generation;
+                            samples = Math.min(queuedSamples, writeBuffer.length);
+                            int first = Math.min(samples, ring.length - readIndex);
+                            System.arraycopy(ring, readIndex, writeBuffer, 0, first);
+                            if (first < samples) {
+                                System.arraycopy(ring, 0, writeBuffer, first, samples - first);
+                            }
+                            readIndex = (readIndex + samples) % ring.length;
+                            queuedSamples -= samples;
+                            inFlightSamples = samples;
+                            ownsAnchor = anchorPending;
+                            blockAnchorUs = anchorUs;
+                            anchorPending = false;
+                            queueLock.notifyAll();
+                        }
+
+                        writeBlock(samples, blockGeneration, ownsAnchor, blockAnchorUs);
+                        synchronized (queueLock) {
+                            if (blockGeneration == generation) {
+                                inFlightSamples = 0;
+                            }
+                            queueLock.notifyAll();
+                        }
+                    }
+                } catch (InterruptedException ignored) {
+                    // requestStop() interrupts pause/queue waits; ownership thread releases output.
+                } catch (Throwable error) {
+                    PlaybackFailure playbackFailure = error instanceof PlaybackFailure
+                            ? (PlaybackFailure) error
+                            : new PlaybackFailure("AudioTrack 写入失败："
+                                    + (error.getMessage() == null
+                                    ? error.getClass().getSimpleName() : error.getMessage()), error);
+                    synchronized (queueLock) {
+                        if (!stopped && !stopRequested) {
+                            failure = playbackFailure;
+                        }
+                    }
+                } finally {
+                    synchronized (queueLock) {
+                        stopped = true;
+                        queuedSamples = 0;
+                        inFlightSamples = 0;
+                        queueLock.notifyAll();
+                    }
+                }
+            }
+
+            private void writeBlock(int sampleCount,
+                                    int blockGeneration,
+                                    boolean ownsAnchor,
+                                    long blockAnchorUs) throws Exception {
+                int written = 0;
+                while (written < sampleCount && !stopped && !stopRequested
+                        && blockGeneration == generation) {
+                    waitWhilePaused();
+                    if (stopped || stopRequested || blockGeneration != generation
+                            || hasPendingSeek()) {
+                        return;
+                    }
+
+                    if (ownsAnchor) {
+                        synchronized (controlLock) {
+                            if (blockGeneration == generation && pendingSeekUs == NO_SEEK
+                                    && !stopped && !stopRequested && !playbackAnchorSet) {
+                                playbackAnchorFrames = Integer.toUnsignedLong(
+                                        output.getPlaybackHeadPosition());
+                                mediaAnchorUs = blockAnchorUs;
+                                playbackAnchorSet = true;
+                                stereoFramesWritten = 0L;
+                            }
+                        }
+                        ownsAnchor = false;
+                    }
+
+                    int result = output.write(writeBuffer, written, sampleCount - written,
+                            AudioTrack.WRITE_BLOCKING);
+                    if (result < 0) {
+                        if (stopped || stopRequested || blockGeneration != generation
+                                || hasPendingSeek()) {
+                            return;
+                        }
+                        throw new PlaybackFailure("AudioTrack 写入失败：" + result);
+                    }
+                    if (result == 0) {
+                        Thread.yield();
+                        continue;
+                    }
+                    written += result;
+
+                    synchronized (controlLock) {
+                        if (blockGeneration != generation || stopped || stopRequested) {
+                            return;
+                        }
+                        stereoFramesWritten += result / 2L;
+                        long primeFrames = outputSampleRate * AUDIO_PRIME_MS / 1_000L;
+                        if (!outputStarted && !paused && pendingSeekUs == NO_SEEK
+                                && playbackAnchorSet && stereoFramesWritten >= primeFrames) {
+                            output.play();
+                            outputStarted = true;
+                        }
+                    }
+                }
+            }
+
+            private void throwIfFailedLocked() throws PlaybackFailure {
+                if (failure != null) {
+                    throw failure;
                 }
             }
         }
@@ -1242,18 +1542,33 @@ public final class PlaybackController {
         }
 
         private void releaseAudioTrack() {
+            PcmWriter writer = pcmWriter;
+            pcmWriter = null;
             AudioTrack output = audioTrack;
             audioTrack = null;
             outputStarted = false;
+            if (writer != null) {
+                writer.requestStop();
+            }
             if (output == null) {
+                if (writer != null) {
+                    writer.awaitStop(AUDIO_WRITER_JOIN_MS);
+                }
                 return;
             }
             try {
                 output.pause();
                 output.flush();
-                output.stop();
             } catch (IllegalStateException ignored) {
                 // release() is valid even if initialization or playback failed.
+            }
+            if (writer != null) {
+                writer.awaitStop(AUDIO_WRITER_JOIN_MS);
+            }
+            try {
+                output.stop();
+            } catch (IllegalStateException ignored) {
+                // A paused or never-started track can reject stop(); release remains valid.
             }
             output.release();
         }
@@ -1547,6 +1862,111 @@ public final class PlaybackController {
                 }
                 output[destination] = left;
                 output[destination + 1] = right;
+                outputFrames++;
+            }
+            return outputFrames;
+        }
+
+        /** Fused signed-16 conversion and FIR decimation; see {@link #processPcm24}. */
+        int processPcm16(short[] input,
+                         int inputOffset,
+                         int inputFrames,
+                         int channels,
+                         float[] output) {
+            if (inputFrames < 0 || inputOffset < 0 || channels <= 0
+                    || inputOffset + inputFrames * channels > input.length) {
+                throw new IllegalArgumentException("Invalid signed 16-bit input");
+            }
+            int outputFrames = 0;
+            int source = inputOffset;
+            for (int frame = 0; frame < inputFrames; frame++) {
+                float left = input[source] / 32_768f;
+                float right = channels == 1 ? left : input[source + 1] / 32_768f;
+                source += channels;
+                ringLeft[ringWrite] = left;
+                ringRight[ringWrite] = right;
+                ringWrite = (ringWrite + 1) & RING_MASK;
+
+                phase += outputRate;
+                if (phase < inputRate) {
+                    continue;
+                }
+                phase -= inputRate;
+                int destination = outputFrames * 2;
+                if (destination + 1 >= output.length) {
+                    throw new IllegalArgumentException("Output buffer is too small");
+                }
+                float filteredLeft = 0f;
+                float filteredRight = 0f;
+                int newest = (ringWrite - 1) & RING_MASK;
+                for (int tap = 0; tap < TAP_COUNT; tap++) {
+                    int history = (newest - tap) & RING_MASK;
+                    float coefficient = coefficients[tap];
+                    filteredLeft += ringLeft[history] * coefficient;
+                    filteredRight += ringRight[history] * coefficient;
+                }
+                output[destination] = filteredLeft;
+                output[destination + 1] = filteredRight;
+                outputFrames++;
+            }
+            return outputFrames;
+        }
+
+        /**
+         * Fused packed-24 conversion and FIR decimation. It is sample-identical to unpacking into
+         * a temporary stereo float array and calling {@link #process(float[], int, float[])}, but
+         * avoids writing and rereading every 192 kHz float before the 48 kHz tape renderer.
+         */
+        int processPcm24(byte[] input,
+                         int inputOffset,
+                         int inputFrames,
+                         int channels,
+                         float[] output) {
+            if (inputFrames < 0 || inputOffset < 0 || channels <= 0
+                    || inputOffset + inputFrames * channels * 3 > input.length) {
+                throw new IllegalArgumentException("Invalid packed 24-bit input");
+            }
+            int outputFrames = 0;
+            int source = inputOffset;
+            int frameBytes = channels * 3;
+            for (int frame = 0; frame < inputFrames; frame++) {
+                int leftPacked = (input[source] & 0xff)
+                        | ((input[source + 1] & 0xff) << 8)
+                        | (input[source + 2] << 16);
+                float left = leftPacked / 8_388_608f;
+                float right = left;
+                if (channels > 1) {
+                    int rightSource = source + 3;
+                    int rightPacked = (input[rightSource] & 0xff)
+                            | ((input[rightSource + 1] & 0xff) << 8)
+                            | (input[rightSource + 2] << 16);
+                    right = rightPacked / 8_388_608f;
+                }
+                source += frameBytes;
+                ringLeft[ringWrite] = left;
+                ringRight[ringWrite] = right;
+                ringWrite = (ringWrite + 1) & RING_MASK;
+
+                phase += outputRate;
+                if (phase < inputRate) {
+                    continue;
+                }
+                phase -= inputRate;
+                int destination = outputFrames * 2;
+                if (destination + 1 >= output.length) {
+                    throw new IllegalArgumentException("Output buffer is too small");
+                }
+                float filteredLeft = 0f;
+                float filteredRight = 0f;
+                int newest = (ringWrite - 1) & RING_MASK;
+                for (int tap = 0; tap < TAP_COUNT; tap++) {
+                    int history = (newest - tap) & RING_MASK;
+                    float coefficient = coefficients[tap];
+                    filteredLeft += ringLeft[history] * coefficient;
+                    filteredRight += ringRight[history] * coefficient;
+                }
+                output[destination] = filteredLeft;
+                output[destination + 1] = filteredRight;
                 outputFrames++;
             }
             return outputFrames;
