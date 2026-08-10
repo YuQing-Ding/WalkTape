@@ -1,59 +1,45 @@
 # WalkTape
 
-WalkTape is an experimental Android project paying homage to classic music mediums, specifically cassette tapes. This project aims to provide users with a nostalgic music playback experience by simulating the sound and operation of various types of portable cassette players.
+WalkTape is an Android cassette-listening experience built around the physical rituals of a tape: choosing a case from a shelf, opening it, unfolding the J-card, selecting a track, and placing the tape into a period player.
 
-## Features
+The current milestone rebuilds the original prototype's interface and playback transport. The first machine target is the 1979 Sony TPS-L2.
 
-- Simulation of three different types of portable cassette players:
-  - **Type A**: Classic portable cassette player Type A
-  - **Type B**: Simulation of Sony TPS-L2
-  - **Type C**: Classic portable cassette player Type C
-- Playback, pause, fast forward, and rewind functions
-- Basic UI
-- Support for multiple audio formats (MP3, WAV, etc.)
+## Current experience
 
-## Installation
+- A responsive cassette shelf with generated demo artwork and optional on-device albums
+- A two-part open case with an acrylic J-card tray and animated cassette
+- An unfolding J-card with liner notes, track list, lyrics, paper folds, and scrolling
+- A track-selection drawer that rotates into a landscape playback scene
+- A code-drawn TPS-L2-inspired player with moving reels, tape-pack progression, mechanical controls, HOT LINE ducking, and HIGH/LOW tone targets
+- Local MediaStore album grouping and embedded artwork loading
+- A stereo PCM playback engine for AAC/M4A, FLAC, MP3, WAV/PCM, Ogg/Vorbis, and Opus (subject to the device's installed codecs)
+- A realtime TPS-L2 reference renderer with digitized LOW/HIGH response curves, fractional-delay wow/flutter, servo/cam transport behavior, measured-spectrum hiss, and gentle tape saturation
 
-Follow these steps to install and run the project locally:
+The old experimental effects remain in the repository for comparison, but playback no longer uses them. Every decoded source now passes through `TpsL2Dsp` as interleaved stereo float PCM.
 
-1. Clone this repository:
-    ```bash
-    git clone https://github.com/YuQing-Ding/WalkTape.git
-    ```
-2. Import the project into Android Studio:
-    - Open Android Studio
-    - Select `File > New > Import Project`, then choose the cloned project directory
-3. Build the project and run it on an emulator or physical device
+## Build
 
-## Usage
+Use Android Studio's bundled JDK (17 or newer) and Android SDK 34.
 
-1. After launching the app, you will see a selection screen where you can choose from three different types of portable cassette players: Type A, Type B (Sony TPS-L2), Type C.
-2. Select the type of cassette player you want to simulate to enter the corresponding interface.
-3. In the cassette player interface, click the "Play" button to start playing music.
-4. Use the "Pause," "Fast Forward," and "Rewind" buttons to control music playback.
-5. You can select different audio files to play through the settings menu within the app.
+```powershell
+$env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'
+.\gradlew.bat testDebugUnitTest assembleDebug lintDebug
+```
 
-## Contributing
+The debug APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
 
-If you would like to contribute to this project, please follow these steps:
+## Visual regression renders
 
-1. Fork this repository
-2. Create your branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+`WalkTapeViewRenderTest` renders the complete primary flow with Robolectric's native Android graphics backend. Its PNGs are written to:
+
+```text
+app/build/reports/walktape-renders/
+```
+
+## Audio engine
+
+The implemented reference model and the remaining physical-unit calibration work are documented in [docs/TPS_L2_AUDIO_PLAN.md](docs/TPS_L2_AUDIO_PLAN.md). The public curve is now modeled, while the stricter “physical twin” badge remains reserved for repeatable capture matching across serviced units.
 
 ## License
 
-This project is licensed under the MIT License
-
-## Acknowledgments
-
-Special thanks to the following resources and libraries:
-
-- [Android Studio](https://developer.android.com/studio)
-- [TarsosDSP](https://github.com/JorenSix/TarsosDSP)
-
----
-
-If you have any questions or suggestions, please feel free to submission of issues
+MIT
