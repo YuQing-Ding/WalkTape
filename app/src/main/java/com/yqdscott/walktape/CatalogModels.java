@@ -31,6 +31,8 @@ public final class CatalogModels {
         public volatile LyricsState lyricsState;
         public volatile String lyricsSource;
         public volatile String lyricsSourceUrl;
+        public volatile String lyricsMessage;
+        public volatile boolean lyricsOpenNetworkSettings;
 
         public Track(long id, String title, long durationMs, String contentUri, String lyrics) {
             this(id, title, "", "", durationMs, contentUri, lyrics);
@@ -54,16 +56,37 @@ public final class CatalogModels {
                     ? LyricsState.IDLE : LyricsState.READY;
             this.lyricsSource = "";
             this.lyricsSourceUrl = "";
+            this.lyricsMessage = "";
+            this.lyricsOpenNetworkSettings = false;
         }
 
         public void updateLyrics(LyricsState state,
                                  String text,
                                  String source,
                                  String sourceUrl) {
+            updateLyrics(state, text, source, sourceUrl, "");
+        }
+
+        public void updateLyrics(LyricsState state,
+                                 String text,
+                                 String source,
+                                 String sourceUrl,
+                                 String message) {
+            updateLyrics(state, text, source, sourceUrl, message, false);
+        }
+
+        public void updateLyrics(LyricsState state,
+                                 String text,
+                                 String source,
+                                 String sourceUrl,
+                                 String message,
+                                 boolean openNetworkSettings) {
             lyricsState = state == null ? LyricsState.ERROR : state;
             lyrics = text == null ? "" : text;
             lyricsSource = source == null ? "" : source;
             lyricsSourceUrl = sourceUrl == null ? "" : sourceUrl;
+            lyricsMessage = message == null ? "" : message;
+            lyricsOpenNetworkSettings = openNetworkSettings;
         }
 
         public void copyLyricsFrom(Track other) {
@@ -71,7 +94,8 @@ public final class CatalogModels {
                 return;
             }
             updateLyrics(other.lyricsState, other.lyrics,
-                    other.lyricsSource, other.lyricsSourceUrl);
+                    other.lyricsSource, other.lyricsSourceUrl, other.lyricsMessage,
+                    other.lyricsOpenNetworkSettings);
         }
     }
 

@@ -83,7 +83,7 @@ public final class PlaybackKeepAliveService extends Service {
         PendingIntent contentIntent = PendingIntent.getActivity(this, 0, launch,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setSmallIcon(R.drawable.ic_notification_walktape)
                 .setContentTitle(title == null || title.trim().isEmpty()
                         ? "WalkTape is playing" : title)
                 .setContentText(artist == null ? "" : artist)

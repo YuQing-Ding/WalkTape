@@ -9,6 +9,10 @@ import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestRunner;
 import org.robolectric.annotation.Config;
 
+import java.io.IOException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
+
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34)
 public class LyricsRepositoryTest {
@@ -63,5 +67,21 @@ public class LyricsRepositoryTest {
         assertTrue(wrong < 64);
         assertTrue(exact > wrong);
         assertFalse(LyricsRepository.stripSyncedLyrics("").length() > 0);
+    }
+
+    @Test
+    public void classifiesOnlyConnectivityFailuresForAutomaticRetry() {
+        assertTrue(LyricsRepository.isTransientNetworkFailure(
+                new UnknownHostException("offline")));
+        assertTrue(LyricsRepository.isTransientNetworkFailure(
+                new IOException("wrapped", new SocketTimeoutException("timeout"))));
+        assertFalse(LyricsRepository.isTransientNetworkFailure(
+                new IOException("Genius search returned 401")));
+
+        LyricsRepository.Result offline = LyricsRepository.Result.networkUnavailable();
+        assertEquals(CatalogModels.LyricsState.ERROR, offline.state);
+        assertTrue(offline.retryWhenOnline);
+        assertTrue(offline.openNetworkSettings);
+        assertTrue(offline.message.contains("网络"));
     }
 }

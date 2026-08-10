@@ -73,6 +73,10 @@ public final class WalkTapeView extends View {
 
         default void onLyricsSourceRequested(CatalogModels.Track track) {
         }
+
+        default void onLyricsNetworkSettingsRequested(CatalogModels.Album album,
+                                                       CatalogModels.Track track) {
+        }
     }
 
     private enum Scene {
@@ -365,33 +369,36 @@ public final class WalkTapeView extends View {
 
     void setTrackLyricsLoading(long trackId) {
         updateTrackLyrics(trackId, CatalogModels.LyricsState.LOADING,
-                "", "", "");
+                "", "", "", "", false);
     }
 
     void setTrackLyrics(long trackId, LyricsRepository.Result result) {
         if (result == null) {
             updateTrackLyrics(trackId, CatalogModels.LyricsState.ERROR,
-                    "", "", "");
+                    "", "", "", "歌词服务返回了空结果", false);
             return;
         }
         updateTrackLyrics(trackId, result.state,
-                result.lyrics, result.source, result.sourceUrl);
+                result.lyrics, result.source, result.sourceUrl, result.message,
+                result.openNetworkSettings);
     }
 
     private void updateTrackLyrics(long trackId,
                                    CatalogModels.LyricsState state,
                                    String lyrics,
                                    String source,
-                                   String sourceUrl) {
+                                   String sourceUrl,
+                                   String message,
+                                   boolean openNetworkSettings) {
         boolean updated = false;
         for (CatalogModels.Album album : albums) {
             updated |= updateAlbumTrackLyrics(album, trackId, state,
-                    lyrics, source, sourceUrl);
+                    lyrics, source, sourceUrl, message, openNetworkSettings);
         }
         updated |= updateAlbumTrackLyrics(selectedAlbum, trackId, state,
-                lyrics, source, sourceUrl);
+                lyrics, source, sourceUrl, message, openNetworkSettings);
         updated |= updateAlbumTrackLyrics(nowPlayingAlbum, trackId, state,
-                lyrics, source, sourceUrl);
+                lyrics, source, sourceUrl, message, openNetworkSettings);
         if (updated) {
             invalidate();
         }
@@ -400,15 +407,18 @@ public final class WalkTapeView extends View {
     private static boolean updateAlbumTrackLyrics(CatalogModels.Album album,
                                                   long trackId,
                                                   CatalogModels.LyricsState state,
-                                                  String lyrics,
-                                                  String source,
-                                                  String sourceUrl) {
+                                                   String lyrics,
+                                                   String source,
+                                                   String sourceUrl,
+                                                   String message,
+                                                   boolean openNetworkSettings) {
         if (album == null) {
             return false;
         }
         for (CatalogModels.Track track : album.tracks) {
             if (track.id == trackId) {
-                track.updateLyrics(state, lyrics, source, sourceUrl);
+                track.updateLyrics(state, lyrics, source, sourceUrl, message,
+                        openNetworkSettings);
                 return true;
             }
         }
@@ -1430,7 +1440,10 @@ public final class WalkTapeView extends View {
                 maximumLines = 8;
                 break;
             case ERROR:
-                lyrics = "歌词线路暂时没有接通。\n\n轻触这里重试";
+                String errorDetail = selectedTrack == null ? "" : selectedTrack.lyricsMessage;
+                lyrics = (errorDetail.isEmpty() ? "歌词服务暂时没有响应。" : errorDetail)
+                        + (selectedTrack != null && selectedTrack.lyricsOpenNetworkSettings
+                        ? "\n\n轻触打开 WalkTape 网络设置" : "\n\n轻触这里重试");
                 lyricColor = muted;
                 maximumLines = 8;
                 break;
@@ -2612,8 +2625,15 @@ public final class WalkTapeView extends View {
                 }
                 break;
             case ACTION_LYRICS_RETRY:
-                requestSelectedLyrics(true);
-                announceForAccessibility("重新检索歌词");
+                CatalogModels.Track retryTrack = getSelectedTrack();
+                if (retryTrack != null && retryTrack.lyricsOpenNetworkSettings
+                        && listener != null) {
+                    listener.onLyricsNetworkSettingsRequested(selectedAlbum, retryTrack);
+                    announceForAccessibility("打开 WalkTape 网络设置");
+                } else {
+                    requestSelectedLyrics(true);
+                    announceForAccessibility("重新检索歌词");
+                }
                 break;
             case ACTION_LYRICS_SOURCE:
                 CatalogModels.Track sourceTrack = getSelectedTrack();

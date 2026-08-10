@@ -6,11 +6,14 @@ import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
@@ -29,6 +32,7 @@ public class MainActivity extends AppCompatActivity implements
 
     private static final int REQUEST_MUSIC_LIBRARY = 41;
     private static final int REQUEST_HOTLINE_MICROPHONE = 42;
+    private static final int REQUEST_LYRICS_NETWORK = 43;
     private final Handler progressHandler = new Handler(Looper.getMainLooper());
     private final Runnable progressTicker = new Runnable() {
         @Override
@@ -43,15 +47,32 @@ public class MainActivity extends AppCompatActivity implements
             progressHandler.postDelayed(this, 180);
         }
     };
+    private final ConnectivityManager.NetworkCallback lyricsNetworkCallback =
+            new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(@NonNull Network network) {
+                    progressHandler.post(MainActivity.this::retryLyricsAfterNetworkRecovery);
+                }
+            };
 
     private WalkTapeView walkTapeView;
     private MusicLibrary musicLibrary;
     private LyricsRepository lyricsRepository;
     private PlaybackController playbackController;
+    private ConnectivityManager connectivityManager;
     private boolean immersivePlayer;
     private boolean libraryStarted;
     private boolean permissionRequestIssued;
     private boolean manualRefreshRequested;
+    private boolean lyricsNetworkCallbackRegistered;
+    private boolean lyricsNetworkPermissionRequestIssued;
+    private CatalogModels.Album pendingPermissionLyricsAlbum;
+    private CatalogModels.Track pendingPermissionLyricsTrack;
+    private boolean pendingPermissionLyricsForceRefresh;
+    private CatalogModels.Album pendingNetworkLyricsAlbum;
+    private CatalogModels.Track pendingNetworkLyricsTrack;
+    private CatalogModels.Album pendingSettingsLyricsAlbum;
+    private CatalogModels.Track pendingSettingsLyricsTrack;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -59,6 +80,7 @@ public class MainActivity extends AppCompatActivity implements
         configureWindow(false);
 
         musicLibrary = new MusicLibrary(this);
+        connectivityManager = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
         lyricsRepository = new LyricsRepository(this, GeniusCredentials.CLIENT_ACCESS_TOKEN);
         playbackController = new PlaybackController(this, this);
         walkTapeView = new WalkTapeView(this);
@@ -68,6 +90,7 @@ public class MainActivity extends AppCompatActivity implements
         walkTapeView.showLibraryLoading();
         walkTapeView.post(this::ensureAutomaticLibraryStart);
         progressHandler.post(progressTicker);
+        registerLyricsNetworkCallback();
     }
 
     @Override
@@ -89,6 +112,26 @@ public class MainActivity extends AppCompatActivity implements
                                            @NonNull String[] permissions,
                                            @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_LYRICS_NETWORK) {
+            lyricsNetworkPermissionRequestIssued = false;
+            CatalogModels.Album album = pendingPermissionLyricsAlbum;
+            CatalogModels.Track track = pendingPermissionLyricsTrack;
+            boolean forceRefresh = pendingPermissionLyricsForceRefresh;
+            pendingPermissionLyricsAlbum = null;
+            pendingPermissionLyricsTrack = null;
+            pendingPermissionLyricsForceRefresh = false;
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (granted && album != null && track != null) {
+                beginLyricsRequest(album, track, forceRefresh);
+            } else if (track != null) {
+                walkTapeView.setTrackLyrics(track.id, LyricsRepository.Result.error(
+                        "WalkTape 的网络权限未开启；请在应用权限中允许网络访问"));
+                Toast.makeText(this, "允许 WalkTape 使用网络后才能在线匹配歌词",
+                        Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
         if (requestCode == REQUEST_HOTLINE_MICROPHONE) {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
@@ -234,6 +277,18 @@ public class MainActivity extends AppCompatActivity implements
         if (lyricsRepository == null || album == null || track == null) {
             return;
         }
+        if (!hasLyricsNetworkPermission()) {
+            pendingPermissionLyricsAlbum = album;
+            pendingPermissionLyricsTrack = track;
+            pendingPermissionLyricsForceRefresh = forceRefresh;
+            walkTapeView.setTrackLyricsLoading(track.id);
+            if (!lyricsNetworkPermissionRequestIssued) {
+                lyricsNetworkPermissionRequestIssued = true;
+                ActivityCompat.requestPermissions(this,
+                        new String[]{Manifest.permission.INTERNET}, REQUEST_LYRICS_NETWORK);
+            }
+            return;
+        }
         beginLyricsRequest(album, track, forceRefresh);
     }
 
@@ -241,8 +296,70 @@ public class MainActivity extends AppCompatActivity implements
                                     CatalogModels.Track track,
                                     boolean forceRefresh) {
         walkTapeView.setTrackLyricsLoading(track.id);
-        lyricsRepository.request(album, track, forceRefresh,
-                result -> walkTapeView.setTrackLyrics(track.id, result));
+        lyricsRepository.request(album, track, forceRefresh, result -> {
+            LyricsRepository.Result delivered = result;
+            walkTapeView.setTrackLyrics(track.id, delivered);
+            if (delivered.retryWhenOnline) {
+                pendingNetworkLyricsAlbum = album;
+                pendingNetworkLyricsTrack = track;
+            } else if (pendingNetworkLyricsTrack != null
+                    && pendingNetworkLyricsTrack.id == track.id) {
+                pendingNetworkLyricsAlbum = null;
+                pendingNetworkLyricsTrack = null;
+            }
+        });
+    }
+
+    @Override
+    public void onLyricsNetworkSettingsRequested(CatalogModels.Album album,
+                                                  CatalogModels.Track track) {
+        if (album == null || track == null) {
+            return;
+        }
+        pendingSettingsLyricsAlbum = album;
+        pendingSettingsLyricsTrack = track;
+        if (pendingNetworkLyricsTrack != null && pendingNetworkLyricsTrack.id == track.id) {
+            pendingNetworkLyricsAlbum = null;
+            pendingNetworkLyricsTrack = null;
+        }
+        try {
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
+        } catch (ActivityNotFoundException exception) {
+            pendingSettingsLyricsAlbum = null;
+            pendingSettingsLyricsTrack = null;
+            Toast.makeText(this, "请在系统设置中允许 WalkTape 使用网络",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private boolean hasLyricsNetworkPermission() {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.INTERNET)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void registerLyricsNetworkCallback() {
+        if (connectivityManager == null || lyricsNetworkCallbackRegistered) {
+            return;
+        }
+        try {
+            connectivityManager.registerDefaultNetworkCallback(lyricsNetworkCallback);
+            lyricsNetworkCallbackRegistered = true;
+        } catch (RuntimeException ignored) {
+            // Lyrics still work normally; only automatic retry is unavailable on this device.
+        }
+    }
+
+    private void retryLyricsAfterNetworkRecovery() {
+        CatalogModels.Album album = pendingNetworkLyricsAlbum;
+        CatalogModels.Track track = pendingNetworkLyricsTrack;
+        if (album == null || track == null || lyricsRepository == null
+                || !hasLyricsNetworkPermission()) {
+            return;
+        }
+        pendingNetworkLyricsAlbum = null;
+        pendingNetworkLyricsTrack = null;
+        beginLyricsRequest(album, track, true);
     }
 
     @Override
@@ -374,6 +491,17 @@ public class MainActivity extends AppCompatActivity implements
         if (musicLibrary != null && hasMusicPermission()) {
             startMusicLibraryIfNeeded();
         }
+        CatalogModels.Album retryAlbum = pendingSettingsLyricsAlbum;
+        CatalogModels.Track retryTrack = pendingSettingsLyricsTrack;
+        if (retryAlbum != null && retryTrack != null && lyricsRepository != null) {
+            pendingSettingsLyricsAlbum = null;
+            pendingSettingsLyricsTrack = null;
+            progressHandler.postDelayed(() -> {
+                if (!isFinishing() && lyricsRepository != null) {
+                    beginLyricsRequest(retryAlbum, retryTrack, true);
+                }
+            }, 450L);
+        }
     }
 
     @Override
@@ -437,6 +565,14 @@ public class MainActivity extends AppCompatActivity implements
     @Override
     protected void onDestroy() {
         progressHandler.removeCallbacksAndMessages(null);
+        if (connectivityManager != null && lyricsNetworkCallbackRegistered) {
+            try {
+                connectivityManager.unregisterNetworkCallback(lyricsNetworkCallback);
+            } catch (RuntimeException ignored) {
+                // It may already be unregistered if the process is being torn down.
+            }
+            lyricsNetworkCallbackRegistered = false;
+        }
         PlaybackKeepAliveService.stop(this);
         if (playbackController != null) {
             playbackController.release();

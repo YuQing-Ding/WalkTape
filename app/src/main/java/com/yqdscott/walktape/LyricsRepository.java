@@ -18,6 +18,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
+import java.net.ConnectException;
+import java.net.NoRouteToHostException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.URL;
@@ -63,38 +67,51 @@ final class LyricsRepository {
         final String sourceUrl;
         final String message;
         final boolean fromCache;
+        final boolean retryWhenOnline;
+        final boolean openNetworkSettings;
 
         private Result(CatalogModels.LyricsState state,
                        String lyrics,
                        String source,
                        String sourceUrl,
                        String message,
-                       boolean fromCache) {
+                       boolean fromCache,
+                       boolean retryWhenOnline,
+                       boolean openNetworkSettings) {
             this.state = state;
             this.lyrics = safe(lyrics);
             this.source = safe(source);
             this.sourceUrl = safe(sourceUrl);
             this.message = safe(message);
             this.fromCache = fromCache;
+            this.retryWhenOnline = retryWhenOnline;
+            this.openNetworkSettings = openNetworkSettings;
         }
 
         static Result ready(String lyrics, String source, String sourceUrl) {
             return new Result(CatalogModels.LyricsState.READY,
-                    lyrics, source, sourceUrl, "", false);
+                    lyrics, source, sourceUrl, "", false, false, false);
         }
 
         static Result notFound() {
             return new Result(CatalogModels.LyricsState.NOT_FOUND,
-                    "", "", "", "没有找到足够可信的歌词匹配", false);
+                    "", "", "", "没有找到足够可信的歌词匹配", false, false, false);
         }
 
         static Result error(String message) {
             return new Result(CatalogModels.LyricsState.ERROR,
-                    "", "", "", message, false);
+                    "", "", "", message, false, false, false);
+        }
+
+        static Result networkUnavailable() {
+            return new Result(CatalogModels.LyricsState.ERROR,
+                    "", "", "", "WalkTape 无法访问网络；请检查网络连接或应用网络权限",
+                    false, true, true);
         }
 
         Result cached() {
-            return new Result(state, lyrics, source, sourceUrl, message, true);
+            return new Result(state, lyrics, source, sourceUrl, message, true,
+                    retryWhenOnline, openNetworkSettings);
         }
     }
 
@@ -212,6 +229,8 @@ final class LyricsRepository {
         }
 
         boolean providerResponded = false;
+        Throwable geniusFailure = null;
+        Throwable lrclibFailure = null;
         if (!geniusAccessToken.isEmpty()) {
             try {
                 ProviderResult genius = fetchFromGenius(request);
@@ -222,6 +241,7 @@ final class LyricsRepository {
                     return result;
                 }
             } catch (IOException | JSONException exception) {
+                geniusFailure = exception;
                 Log.w(LOG_TAG, "Genius request failed: "
                         + exception.getClass().getSimpleName() + ": " + exception.getMessage());
                 // A blocked lyrics page must not prevent the independent public fallback.
@@ -237,6 +257,7 @@ final class LyricsRepository {
                 return result;
             }
         } catch (IOException | JSONException exception) {
+            lrclibFailure = exception;
             Log.w(LOG_TAG, "LRCLIB request failed: "
                     + exception.getClass().getSimpleName() + ": " + exception.getMessage());
             // Report a transient error below only when neither provider answered coherently.
@@ -247,7 +268,25 @@ final class LyricsRepository {
             cache.write(request.cacheKey, result, now);
             return result;
         }
-        return Result.error("网络或歌词服务暂时没有响应");
+        if (isTransientNetworkFailure(geniusFailure)
+                || isTransientNetworkFailure(lrclibFailure)) {
+            return Result.networkUnavailable();
+        }
+        return Result.error("歌词服务暂时没有响应");
+    }
+
+    static boolean isTransientNetworkFailure(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof UnknownHostException
+                    || current instanceof ConnectException
+                    || current instanceof NoRouteToHostException
+                    || current instanceof SocketTimeoutException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     private ProviderResult fetchFromGenius(Request request) throws IOException, JSONException {
@@ -1075,7 +1114,7 @@ final class LyricsRepository {
                     return null;
                 }
                 return new Result(state, cursor.getString(1), cursor.getString(2),
-                        cursor.getString(3), cursor.getString(4), true);
+                        cursor.getString(3), cursor.getString(4), true, false, false);
             }
         }
 

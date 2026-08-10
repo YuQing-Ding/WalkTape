@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Cassette shell, kept inside the adaptive-icon 66 dp safe zone. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M27,27 C23.7,27 21,29.7 21,33 L21,75 C21,78.3 23.7,81 27,81 L81,81 C84.3,81 87,78.3 87,75 L87,33 C87,29.7 84.3,27 81,27 Z M27,32 L81,32 C81.6,32 82,32.4 82,33 L82,75 C82,75.6 81.6,76 81,76 L27,76 C26.4,76 26,75.6 26,75 L26,33 C26,32.4 26.4,32 27,32 Z" />
+
+    <!-- Tape window. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M30,35 L78,35 L78,60 L30,60 Z M35,40 L73,40 L73,55 L35,55 Z" />
+
+    <!-- Left and right reels. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M43,41.5 A6,6 0,1 0,43 53.5 A6,6 0,1 0,43 41.5 Z M43,45 A2.5,2.5 0,1 1,43 50 A2.5,2.5 0,1 1,43 45 Z M65,41.5 A6,6 0,1 0,65 53.5 A6,6 0,1 0,65 41.5 Z M65,45 A2.5,2.5 0,1 1,65 50 A2.5,2.5 0,1 1,65 45 Z" />
+
+    <!-- Waveform between the reels. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M50,46 L52,46 L52,49 L50,49 Z M53,43 L55,43 L55,52 L53,52 Z M56,45 L58,45 L58,50 L56,50 Z" />
+
+    <!-- Lower cassette mechanism. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M35,64 L73,64 L77,75 L31,75 Z M38,68 L70,68 L71.5,72 L36.5,72 Z" />
+</vector>
