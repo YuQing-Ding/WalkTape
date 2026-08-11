@@ -33,6 +33,9 @@ public class MainActivity extends AppCompatActivity implements
     private static final int REQUEST_MUSIC_LIBRARY = 41;
     private static final int REQUEST_HOTLINE_MICROPHONE = 42;
     private static final int REQUEST_LYRICS_NETWORK = 43;
+    private static final String PREFERENCES = "walktape_preferences";
+    private static final String KEY_MACHINE_PROFILE = "machine_profile";
+    private static final String KEY_TAPE_PROFILE = "tape_profile";
     private final Handler progressHandler = new Handler(Looper.getMainLooper());
     private final Runnable progressTicker = new Runnable() {
         @Override
@@ -85,6 +88,21 @@ public class MainActivity extends AppCompatActivity implements
         playbackController = new PlaybackController(this, this);
         walkTapeView = new WalkTapeView(this);
         walkTapeView.setListener(this);
+        TapeMachineProfile savedProfile = TapeMachineProfile.forId(
+                getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                        .getString(KEY_MACHINE_PROFILE, TapeMachineProfile.SONY_TPS_L2));
+        TapeStockProfile savedTapeProfile = TapeStockProfile.forId(
+                getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                        .getString(KEY_TAPE_PROFILE, TapeStockProfile.SONY_CHF_1978));
+        playbackController.setMachineProfile(savedProfile);
+        playbackController.setTapeProfile(savedTapeProfile);
+        walkTapeView.setMachineProfile(savedProfile);
+        walkTapeView.setTapeProfile(savedTapeProfile);
+        if (savedProfile.isAiwaHsJx707()) {
+            boolean highPosition = savedTapeProfile.isHighPosition();
+            playbackController.setHighTape(highPosition);
+            walkTapeView.setHighTape(highPosition);
+        }
         setContentView(walkTapeView);
 
         walkTapeView.showLibraryLoading();
@@ -261,6 +279,34 @@ public class MainActivity extends AppCompatActivity implements
     @Override
     public void onToneChanged(boolean highTape) {
         playbackController.setHighTape(highTape);
+    }
+
+    @Override
+    public void onMachineProfileChanged(TapeMachineProfile profile) {
+        if (profile == null) {
+            return;
+        }
+        if (!profile.hotlineSupported) {
+            playbackController.setHotlineEnabled(false);
+            walkTapeView.setHotlineActive(false);
+        }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_MACHINE_PROFILE, profile.id)
+                .apply();
+        playbackController.setMachineProfile(profile);
+    }
+
+    @Override
+    public void onTapeProfileChanged(TapeStockProfile profile) {
+        if (profile == null) {
+            return;
+        }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_TAPE_PROFILE, profile.id)
+                .apply();
+        playbackController.setTapeProfile(profile);
     }
 
     @Override

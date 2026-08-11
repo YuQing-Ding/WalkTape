@@ -14,6 +14,7 @@ import android.net.Uri;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.util.Log;
+import android.view.WindowManager;
 
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
@@ -97,6 +98,214 @@ public class PlaybackDeviceTest {
             assertTrue("Seek recovery introduced repeated AudioTrack underruns: before="
                             + underrunsBeforeSeek + " after=" + underrunsAfterSeek,
                     underrunsAfterSeek <= underrunsBeforeSeek + 1);
+        } finally {
+            controller.release();
+        }
+    }
+
+    @Test
+    public void alacEndOfStreamCompletesInsteadOfMasqueradingAsDrm() throws Exception {
+        String requestedUri = InstrumentationRegistry.getArguments().getString("mediaUri");
+        Assume.assumeNotNull(requestedUri);
+        Uri uri = Uri.parse(requestedUri);
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        long durationMs = readDurationMs(context, uri);
+        Assume.assumeTrue(durationMs > 5_000L);
+
+        CountDownLatch prepared = new CountDownLatch(1);
+        CountDownLatch terminal = new CountDownLatch(1);
+        AtomicReference<String> error = new AtomicReference<>();
+        AtomicLong completions = new AtomicLong();
+        PlaybackController controller = new PlaybackController(context,
+                new PlaybackController.Listener() {
+                    @Override public void onPrepared(long value) { prepared.countDown(); }
+                    @Override public void onCompleted() {
+                        completions.incrementAndGet();
+                        terminal.countDown();
+                    }
+                    @Override public void onError(String message) {
+                        error.set(message);
+                        terminal.countDown();
+                    }
+                });
+        try {
+            Field ducking = PlaybackController.class.getDeclaredField("ducking");
+            ducking.setAccessible(true);
+            ducking.setFloat(controller, 0f);
+            controller.loadAndPlay(new CatalogModels.Track(
+                    2L, "ALAC end-of-stream check", durationMs, uri.toString(), ""));
+            assertTrue("ALAC playback did not prepare", prepared.await(12, TimeUnit.SECONDS));
+            assertNull(error.get(), error.get());
+
+            // Let the real output route become active before accelerating to the final packet.
+            // Seeking a stream before its first AudioTrack frame is a separate platform edge case;
+            // the user-visible regression here is a normally playing M4A reaching clean EOS.
+            waitForPosition(controller, 250L, error, 8_000L);
+            assertNull(error.get(), error.get());
+            controller.seekToFraction((durationMs - 1_500f) / durationMs);
+            boolean terminalDelivered = terminal.await(30, TimeUnit.SECONDS);
+            assertTrue("ALAC did not reach a terminal callback; "
+                            + playbackDiagnostics(controller), terminalDelivered);
+            assertNull("A clear ALAC end-of-stream was misreported", error.get());
+            assertEquals("ALAC completion callback was lost", 1L, completions.get());
+        } finally {
+            controller.release();
+        }
+    }
+
+    @Test
+    public void firstToneChangeClearsRenderedLookaheadAndResumes() throws Exception {
+        String requestedUri = InstrumentationRegistry.getArguments().getString("mediaUri");
+        Assume.assumeNotNull(requestedUri);
+        Uri uri = Uri.parse(requestedUri);
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        long durationMs = readDurationMs(context, uri);
+        CountDownLatch prepared = new CountDownLatch(1);
+        AtomicReference<String> error = new AtomicReference<>();
+        PlaybackController controller = new PlaybackController(context,
+                new PlaybackController.Listener() {
+                    @Override public void onPrepared(long value) { prepared.countDown(); }
+                    @Override public void onCompleted() { }
+                    @Override public void onError(String message) {
+                        error.set(message);
+                        prepared.countDown();
+                    }
+                });
+        try {
+            Field ducking = PlaybackController.class.getDeclaredField("ducking");
+            ducking.setAccessible(true);
+            ducking.setFloat(controller, 0f);
+            controller.loadAndPlay(new CatalogModels.Track(
+                    3L, "Tone switch check", durationMs, uri.toString(), ""));
+            assertTrue("Tone test did not prepare", prepared.await(12, TimeUnit.SECONDS));
+            assertNull(error.get(), error.get());
+            waitForPosition(controller, 800L, error, 10_000L);
+            assertNull(error.get(), error.get());
+
+            long positionBefore = controller.getPositionMs();
+            int generationBefore = readPcmWriterGeneration(controller);
+            int underrunsBefore = readUnderrunCount(controller);
+            controller.setHighTape(false);
+            waitForPosition(controller, positionBefore + 300L, error, 6_000L);
+
+            assertNull(error.get(), error.get());
+            assertTrue("The first HIGH-to-LOW request did not reach the active session",
+                    !readSessionBoolean(controller, "sessionHighTape"));
+            assertTrue("The first tone request left pre-rendered HIGH audio queued",
+                    readPcmWriterGeneration(controller) >= generationBefore + 2);
+            assertTrue("Playback did not resume after the first tone request; "
+                            + playbackDiagnostics(controller),
+                    controller.getPositionMs() >= positionBefore + 300L);
+            assertTrue("Tone re-render introduced repeated AudioTrack underruns",
+                    readUnderrunCount(controller) <= underrunsBefore + 1);
+        } finally {
+            controller.release();
+        }
+    }
+
+    @Test
+    public void liveMachineChangeRebuildsDspAtTheAudiblePlayhead() throws Exception {
+        String requestedUri = InstrumentationRegistry.getArguments().getString("mediaUri");
+        Assume.assumeNotNull(requestedUri);
+        Uri uri = Uri.parse(requestedUri);
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        long durationMs = readDurationMs(context, uri);
+        CountDownLatch prepared = new CountDownLatch(1);
+        AtomicReference<String> error = new AtomicReference<>();
+        PlaybackController controller = new PlaybackController(context,
+                new PlaybackController.Listener() {
+                    @Override public void onPrepared(long value) { prepared.countDown(); }
+                    @Override public void onCompleted() { }
+                    @Override public void onError(String message) {
+                        error.set(message);
+                        prepared.countDown();
+                    }
+                });
+        try {
+            Field ducking = PlaybackController.class.getDeclaredField("ducking");
+            ducking.setAccessible(true);
+            ducking.setFloat(controller, 0f);
+            controller.loadAndPlay(new CatalogModels.Track(
+                    4L, "Machine switch check", durationMs, uri.toString(), ""));
+            assertTrue("Machine switch test did not prepare",
+                    prepared.await(12, TimeUnit.SECONDS));
+            assertNull(error.get(), error.get());
+            waitForPosition(controller, 800L, error, 10_000L);
+
+            long positionBefore = controller.getPositionMs();
+            int generationBefore = readPcmWriterGeneration(controller);
+            int underrunsBefore = readUnderrunCount(controller);
+            controller.setMachineProfile(TapeMachineProfile.aiwaHsJx707Reference());
+            waitForPosition(controller, positionBefore + 350L, error, 7_000L);
+
+            assertNull(error.get(), error.get());
+            Object renderer = readSessionField(controller, "dsp");
+            assertTrue("Live selection did not install the cassette signal chain",
+                    renderer instanceof CassetteSignalChainDsp);
+            assertTrue("Live selection did not install the dedicated Aiwa machine layer",
+                    ((CassetteSignalChainDsp) renderer).machineRenderer()
+                            instanceof AiwaHsJx707Dsp);
+            assertEquals(TapeMachineProfile.AIWA_HS_JX707,
+                    readSessionField(controller, "dspProfileId"));
+            assertTrue("Old TPS-L2 lookahead was not discarded",
+                    readPcmWriterGeneration(controller) >= generationBefore + 2);
+            assertTrue("Playback did not resume after the profile rebuild",
+                    controller.getPositionMs() >= positionBefore + 350L);
+            assertTrue("Machine change introduced repeated AudioTrack underruns",
+                    readUnderrunCount(controller) <= underrunsBefore + 1);
+        } finally {
+            controller.release();
+        }
+    }
+
+    @Test
+    public void liveTapeChangeRebuildsMagneticStockAtTheAudiblePlayhead() throws Exception {
+        String requestedUri = InstrumentationRegistry.getArguments().getString("mediaUri");
+        Assume.assumeNotNull(requestedUri);
+        Uri uri = Uri.parse(requestedUri);
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        long durationMs = readDurationMs(context, uri);
+        CountDownLatch prepared = new CountDownLatch(1);
+        AtomicReference<String> error = new AtomicReference<>();
+        PlaybackController controller = new PlaybackController(context,
+                new PlaybackController.Listener() {
+                    @Override public void onPrepared(long value) { prepared.countDown(); }
+                    @Override public void onCompleted() { }
+                    @Override public void onError(String message) {
+                        error.set(message);
+                        prepared.countDown();
+                    }
+                });
+        try {
+            Field ducking = PlaybackController.class.getDeclaredField("ducking");
+            ducking.setAccessible(true);
+            ducking.setFloat(controller, 0f);
+            controller.loadAndPlay(new CatalogModels.Track(
+                    5L, "Tape switch check", durationMs, uri.toString(), ""));
+            assertTrue("Tape switch test did not prepare",
+                    prepared.await(12, TimeUnit.SECONDS));
+            assertNull(error.get(), error.get());
+            waitForPosition(controller, 800L, error, 10_000L);
+
+            long positionBefore = controller.getPositionMs();
+            int generationBefore = readPcmWriterGeneration(controller);
+            int underrunsBefore = readUnderrunCount(controller);
+            controller.setTapeProfile(TapeStockProfile.tdkSa1988());
+            waitForPosition(controller, positionBefore + 350L, error, 7_000L);
+
+            assertNull(error.get(), error.get());
+            Object renderer = readSessionField(controller, "dsp");
+            assertTrue(renderer instanceof CassetteSignalChainDsp);
+            assertEquals(TapeStockProfile.TDK_SA_1988,
+                    ((CassetteSignalChainDsp) renderer).tapeProfile().id);
+            assertEquals(TapeStockProfile.TDK_SA_1988,
+                    readSessionField(controller, "dspTapeProfileId"));
+            assertTrue("Old tape-stock lookahead was not discarded",
+                    readPcmWriterGeneration(controller) >= generationBefore + 2);
+            assertTrue("Playback did not resume after the tape rebuild",
+                    controller.getPositionMs() >= positionBefore + 350L);
+            assertTrue("Tape change introduced repeated AudioTrack underruns",
+                    readUnderrunCount(controller) <= underrunsBefore + 1);
         } finally {
             controller.release();
         }
@@ -188,6 +397,10 @@ public class PlaybackDeviceTest {
             Field ducking = PlaybackController.class.getDeclaredField("ducking");
             ducking.setAccessible(true);
             ducking.setFloat(controller, 0f);
+            String machineArgument = InstrumentationRegistry.getArguments().getString("machine");
+            if (TapeMachineProfile.AIWA_HS_JX707.equals(machineArgument)) {
+                controller.setMachineProfile(TapeMachineProfile.aiwaHsJx707Reference());
+            }
             controller.loadAndPlay(new CatalogModels.Track(
                     77L, "Sustained high-resolution check", durationMs, uri.toString(), ""));
 
@@ -218,7 +431,8 @@ public class PlaybackDeviceTest {
             assertTrue("Long high-resolution playback did not remain realtime",
                     controller.getPositionMs() >= targetMs);
             int underrunsAfterRun = output.getUnderrunCount();
-            Log.i(PLAYBACK_TAG, "sustained source=" + uri
+            Log.i(PLAYBACK_TAG, "sustained machine=" + controller.getMachineProfileForTest().id
+                    + " source=" + uri
                     + " targetMs=" + targetMs
                     + " bufferFrames=" + output.getBufferCapacityInFrames()
                     + " underruns=" + underrunsAtOneSecond + "->"
@@ -228,6 +442,82 @@ public class PlaybackDeviceTest {
                     underrunsAfterRun <= underrunsAtOneSecond + 1);
         } finally {
             controller.release();
+        }
+    }
+
+    @Test
+    public void m4aCompletionLoadsTheNextAlbumTrack() throws Exception {
+        String requestedUri = InstrumentationRegistry.getArguments().getString("mediaUri");
+        String requestedNextUri = InstrumentationRegistry.getArguments().getString("nextMediaUri");
+        Assume.assumeNotNull(requestedUri, requestedNextUri);
+        Uri firstUri = Uri.parse(requestedUri);
+        Uri secondUri = Uri.parse(requestedNextUri);
+        Instrumentation instrumentation = InstrumentationRegistry.getInstrumentation();
+        Context context = instrumentation.getTargetContext();
+        long firstDurationMs = readDurationMs(context, firstUri);
+        long secondDurationMs = readDurationMs(context, secondUri);
+        Intent intent = new Intent(context, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        MainActivity activity = (MainActivity) instrumentation.startActivitySync(intent);
+        try {
+            Field controllerField = MainActivity.class.getDeclaredField("playbackController");
+            controllerField.setAccessible(true);
+            PlaybackController controller = (PlaybackController) controllerField.get(activity);
+            Field ducking = PlaybackController.class.getDeclaredField("ducking");
+            ducking.setAccessible(true);
+            ducking.setFloat(controller, 0f);
+            Field viewField = MainActivity.class.getDeclaredField("walkTapeView");
+            viewField.setAccessible(true);
+            WalkTapeView view = (WalkTapeView) viewField.get(activity);
+
+            CatalogModels.Track first = new CatalogModels.Track(
+                    401L, "M4A side A", firstDurationMs, firstUri.toString(), "");
+            CatalogModels.Track second = new CatalogModels.Track(
+                    402L, "M4A side B", secondDurationMs, secondUri.toString(), "");
+            CatalogModels.Album album = new CatalogModels.Album(
+                    400L, "M4A auto-next", "WalkTape", "1979", "",
+                    0xff202020, 0xffeeeeee, 0xffe6532d, 0,
+                    java.util.Arrays.asList(first, second));
+
+            instrumentation.runOnMainSync(() -> {
+                try {
+                    view.setAlbums(java.util.Collections.singletonList(album), true);
+                    Field selectedAlbum = WalkTapeView.class.getDeclaredField("selectedAlbum");
+                    selectedAlbum.setAccessible(true);
+                    selectedAlbum.set(view, album);
+                    Field selectedAlbumIndex = WalkTapeView.class.getDeclaredField(
+                            "selectedAlbumIndex");
+                    selectedAlbumIndex.setAccessible(true);
+                    selectedAlbumIndex.setInt(view, 0);
+                    Method enterPlayer = WalkTapeView.class.getDeclaredMethod(
+                            "enterPlayer", int.class);
+                    enterPlayer.setAccessible(true);
+                    enterPlayer.invoke(view, 0);
+                } catch (ReflectiveOperationException error) {
+                    throw new AssertionError(error);
+                }
+            });
+            AtomicReference<String> noError = new AtomicReference<>();
+            waitForPosition(controller, 500L, noError, 10_000L);
+            assertTrue("First M4A did not begin playing", controller.getPositionMs() >= 500L);
+            controller.seekToFraction((firstDurationMs - 1_500f) / firstDurationMs);
+
+            long deadline = SystemClock.elapsedRealtime() + 12_000L;
+            while ((view.getNowPlayingTrack() == null
+                    || view.getNowPlayingTrack().id != second.id
+                    || !controller.isPlaying()
+                    || controller.getPositionMs() < 250L)
+                    && SystemClock.elapsedRealtime() < deadline) {
+                SystemClock.sleep(40L);
+            }
+            assertTrue("Clean M4A EOS did not select the next track",
+                    view.getNowPlayingTrack() != null
+                            && view.getNowPlayingTrack().id == second.id);
+            assertTrue("The next M4A was selected but its decoder did not start",
+                    controller.isPlaying() && controller.getPositionMs() >= 250L);
+        } finally {
+            instrumentation.runOnMainSync(activity::finish);
+            instrumentation.waitForIdleSync();
         }
     }
 
@@ -249,7 +539,6 @@ public class PlaybackDeviceTest {
             Field ducking = PlaybackController.class.getDeclaredField("ducking");
             ducking.setAccessible(true);
             ducking.setFloat(controller, 0f);
-
             CatalogModels.Track track = new CatalogModels.Track(
                     88L, "Background transport check", durationMs, uri.toString(), "");
             CatalogModels.Album album = new CatalogModels.Album(
@@ -280,10 +569,18 @@ public class PlaybackDeviceTest {
         Instrumentation instrumentation = InstrumentationRegistry.getInstrumentation();
         Context context = instrumentation.getTargetContext();
         long durationMs = readDurationMs(context, uri);
+        wakeDevice(instrumentation);
         Intent intent = new Intent(context, MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         MainActivity activity = (MainActivity) instrumentation.startActivitySync(intent);
         try {
+            // A preceding screen-off regression may leave a secure test handset at its lock
+            // screen. Show this test window above it; no unlock credentials are needed or read.
+            instrumentation.runOnMainSync(() -> activity.getWindow().addFlags(
+                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                            | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                            | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON));
+            instrumentation.waitForIdleSync();
             Field controllerField = MainActivity.class.getDeclaredField("playbackController");
             controllerField.setAccessible(true);
             PlaybackController controller = (PlaybackController) controllerField.get(activity);
@@ -399,6 +696,10 @@ public class PlaybackDeviceTest {
             Field ducking = PlaybackController.class.getDeclaredField("ducking");
             ducking.setAccessible(true);
             ducking.setFloat(controller, 0f);
+            String machineArgument = InstrumentationRegistry.getArguments().getString("machine");
+            if (TapeMachineProfile.AIWA_HS_JX707.equals(machineArgument)) {
+                controller.setMachineProfile(TapeMachineProfile.aiwaHsJx707Reference());
+            }
 
             CatalogModels.Track track = new CatalogModels.Track(
                     288L, "Screen-off high-resolution check", durationMs, uri.toString(), "");
@@ -508,6 +809,75 @@ public class PlaybackDeviceTest {
         Field outputField = session.getClass().getDeclaredField("audioTrack");
         outputField.setAccessible(true);
         return (AudioTrack) outputField.get(session);
+    }
+
+    private static boolean readSessionBoolean(PlaybackController controller, String name)
+            throws Exception {
+        Field sessionField = PlaybackController.class.getDeclaredField("session");
+        sessionField.setAccessible(true);
+        Object session = sessionField.get(controller);
+        Field value = session.getClass().getDeclaredField(name);
+        value.setAccessible(true);
+        return value.getBoolean(session);
+    }
+
+    private static Object readSessionField(PlaybackController controller, String name)
+            throws Exception {
+        Field sessionField = PlaybackController.class.getDeclaredField("session");
+        sessionField.setAccessible(true);
+        Object session = sessionField.get(controller);
+        Field value = session.getClass().getDeclaredField(name);
+        value.setAccessible(true);
+        return value.get(session);
+    }
+
+    private static int readPcmWriterGeneration(PlaybackController controller) throws Exception {
+        Field sessionField = PlaybackController.class.getDeclaredField("session");
+        sessionField.setAccessible(true);
+        Object session = sessionField.get(controller);
+        Field writerField = session.getClass().getDeclaredField("pcmWriter");
+        writerField.setAccessible(true);
+        Object writer = writerField.get(session);
+        Field generation = writer.getClass().getDeclaredField("generation");
+        generation.setAccessible(true);
+        return generation.getInt(writer);
+    }
+
+    private static String playbackDiagnostics(PlaybackController controller) throws Exception {
+        Field sessionField = PlaybackController.class.getDeclaredField("session");
+        sessionField.setAccessible(true);
+        Object session = sessionField.get(controller);
+        if (session == null) {
+            return "session=null";
+        }
+        StringBuilder result = new StringBuilder("position=")
+                .append(controller.getPositionMs());
+        for (String name : new String[]{"pendingSeekUs", "playbackAnchorSet",
+                "stereoFramesWritten", "outputStarted", "audioPrimeMs"}) {
+            Field field = session.getClass().getDeclaredField(name);
+            field.setAccessible(true);
+            result.append(' ').append(name).append('=').append(field.get(session));
+        }
+        Field writerField = session.getClass().getDeclaredField("pcmWriter");
+        writerField.setAccessible(true);
+        Object writer = writerField.get(session);
+        if (writer != null) {
+            result.append(" writerState=").append(((Thread) writer).getState());
+            for (String name : new String[]{"queuedSamples", "inFlightSamples",
+                    "generation", "stopped", "failure"}) {
+                Field field = writer.getClass().getDeclaredField(name);
+                field.setAccessible(true);
+                result.append(' ').append(name).append('=').append(field.get(writer));
+            }
+        }
+        AudioTrack output = readAudioTrack(controller);
+        if (output != null) {
+            result.append(" playState=").append(output.getPlayState())
+                    .append(" head=").append(Integer.toUnsignedLong(
+                            output.getPlaybackHeadPosition()))
+                    .append(" underruns=").append(output.getUnderrunCount());
+        }
+        return result.toString();
     }
 
     private static void wakeDevice(Instrumentation instrumentation) throws Exception {

@@ -17,6 +17,8 @@ public final class AlacFrameDecoder {
     private final int bitsPerSample;
     private final int channelCount;
     private final int sampleRate;
+    private final int maximumSamplesPerFrame;
+    private final int maximumOutputInts;
     private byte[] packetBuffer = new byte[0];
 
     public AlacFrameDecoder(byte[] codecSpecificData) {
@@ -27,10 +29,12 @@ public final class AlacFrameDecoder {
         // MediaExtractor exposes the ALACSpecificConfig itself. jALD's core expects that same
         // structure after the 24-byte pseudo atom prefix made by its legacy demuxer.
         int configStart = codecSpecificData.length - ALAC_CONFIG_SIZE;
+        maximumSamplesPerFrame = readBigEndianInt(codecSpecificData, configStart);
         bitsPerSample = codecSpecificData[configStart + 5] & 0xff;
         channelCount = codecSpecificData[configStart + 9] & 0xff;
         sampleRate = readBigEndianInt(codecSpecificData, configStart + 20);
-        if ((bitsPerSample != 16 && bitsPerSample != 24)
+        if (maximumSamplesPerFrame <= 0 || maximumSamplesPerFrame > 65_536
+                || (bitsPerSample != 16 && bitsPerSample != 24)
                 || channelCount < 1 || channelCount > 2 || sampleRate <= 0) {
             throw new IllegalArgumentException("Unsupported ALAC configuration: "
                     + bitsPerSample + "-bit, " + channelCount + " channels, "
@@ -43,6 +47,13 @@ public final class AlacFrameDecoder {
         }
         decoder = AlacDecodeUtils.create_alac(bitsPerSample, channelCount);
         AlacDecodeUtils.alac_set_info(decoder, decoderInfo);
+
+        // jALD represents 16-bit output as one signed sample per int, but represents 24-bit
+        // output as three byte-valued ints per sample. Size each queued frame for the actual ALAC
+        // configuration instead of retaining the historical 73,728-int worst-case allocation.
+        int intsPerSample = bitsPerSample == 24 ? 3 : 1;
+        maximumOutputInts = maximumSamplesPerFrame * channelCount * intsPerSample
+                + (channelCount == 1 ? intsPerSample : 0);
     }
 
     public int getBitsPerSample() {
@@ -61,13 +72,22 @@ public final class AlacFrameDecoder {
         return sampleRate;
     }
 
+    public int getMaximumSamplesPerFrame() {
+        return maximumSamplesPerFrame;
+    }
+
+    public int getMaximumOutputInts() {
+        return maximumOutputInts;
+    }
+
     /** Decodes one complete MediaExtractor sample and returns the number of PCM bytes produced. */
     public int decode(byte[] packet, int packetSize, int[] output) {
         if (packet == null || packetSize <= 0 || packetSize > packet.length) {
             throw new IllegalArgumentException("Invalid ALAC packet");
         }
-        if (output == null || output.length < 73_728) {
-            throw new IllegalArgumentException("ALAC output buffer must contain 73,728 ints");
+        if (output == null || output.length < maximumOutputInts) {
+            throw new IllegalArgumentException("ALAC output buffer must contain at least "
+                    + maximumOutputInts + " ints");
         }
         int paddedSize = packetSize + 3;
         if (packetBuffer.length < paddedSize) {
@@ -75,7 +95,7 @@ public final class AlacFrameDecoder {
         }
         System.arraycopy(packet, 0, packetBuffer, 0, packetSize);
         Arrays.fill(packetBuffer, packetSize, packetSize + 3, (byte) 0);
-        return AlacDecodeUtils.decode_frame(decoder, packetBuffer, output, 73_728);
+        return AlacDecodeUtils.decode_frame(decoder, packetBuffer, output, maximumOutputInts);
     }
 
     private static int readBigEndianInt(byte[] source, int offset) {

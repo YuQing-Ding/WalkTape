@@ -116,6 +116,87 @@ public class WalkTapeViewRenderTest {
     }
 
     @Test
+    public void machineRoomSelectsAndRendersTheAiwaProfile() throws IOException {
+        MachineListener listener = new MachineListener();
+        view.setListener(listener);
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+
+        tap(624, 93); // machine-room button beside the live library indicator
+        Bitmap selector = settleAndRender(1080, 2160);
+        save(selector, "10-machine-room.png");
+        tap(520, 1_180); // Aiwa HS-JX707 profile card
+        settleAndRender(1080, 2160);
+
+        assertEquals(TapeMachineProfile.AIWA_HS_JX707, view.getMachineProfile().id);
+        assertEquals(1, listener.profileChanges);
+        assertEquals(TapeMachineProfile.AIWA_HS_JX707, listener.lastProfile.id);
+
+        tap(210, 610);
+        settleAndRender(1080, 2160);
+        tap(790, 560);
+        settleAndRender(1080, 2160);
+        tap(300, 1100);
+        layout(2160, 1080);
+        Bitmap aiwaPlayer = settleAndRender(2160, 1080);
+        save(aiwaPlayer, "11-player-aiwa-jx707.png");
+
+        assertTrue(new File(outputDirectory(), "10-machine-room.png").length() > 40_000);
+        assertTrue(new File(outputDirectory(), "11-player-aiwa-jx707.png").length() > 40_000);
+    }
+
+    @Test
+    public void signalChainTapeTabSelectsAndRendersARealTapeStock() throws IOException {
+        MachineListener listener = new MachineListener();
+        view.setListener(listener);
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+
+        tap(624, 93);
+        settleAndRender(1080, 2160);
+        tap(760, 790); // TAPE STOCK tab
+        Bitmap tapeSelector = settleAndRender(1080, 2160);
+        save(tapeSelector, "12-tape-stock-selector.png");
+        tap(520, 1_155); // TDK SA Type II card
+        settleAndRender(1080, 2160);
+
+        assertEquals(TapeStockProfile.TDK_SA_1988, view.getTapeProfile().id);
+        assertEquals(1, listener.tapeProfileChanges);
+        assertEquals(TapeStockProfile.TDK_SA_1988, listener.lastTapeProfile.id);
+
+        tap(210, 610);
+        settleAndRender(1080, 2160);
+        tap(790, 560);
+        settleAndRender(1080, 2160);
+        tap(300, 1100);
+        layout(2160, 1080);
+        Bitmap tapePlayer = settleAndRender(2160, 1080);
+        save(tapePlayer, "13-player-tdk-sa.png");
+
+        assertTrue(new File(outputDirectory(), "12-tape-stock-selector.png").length() > 40_000);
+        assertTrue(new File(outputDirectory(), "13-player-tdk-sa.png").length() > 40_000);
+    }
+
+    @Test
+    public void aiwaProfileDoesNotExposeTheSonyHotLineControl() {
+        MachineListener listener = new MachineListener();
+        view.setListener(listener);
+        view.setMachineProfile(TapeMachineProfile.aiwaHsJx707Reference());
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+        tap(210, 610);
+        settleAndRender(1080, 2160);
+        tap(790, 560);
+        settleAndRender(1080, 2160);
+        tap(300, 1100);
+        layout(2160, 1080);
+        settleAndRender(2160, 1080);
+
+        tap(105, 165); // physical HOT LINE location on TPS-L2
+        assertEquals(0, listener.hotlineChanges);
+    }
+
+    @Test
     public void scrubPreviewsManyMovesButCommitsOnlyOneDecoderSeek() {
         layout(1080, 2160);
         settleAndRender(1080, 2160);
@@ -200,6 +281,26 @@ public class WalkTapeViewRenderTest {
                 now, now + 180, MotionEvent.ACTION_UP, 105, 165, 0));
         assertEquals(1, listener.started);
         assertEquals(1, listener.stopped);
+    }
+
+    @Test
+    public void toneSwitchChangesStateOnTheFirstTap() {
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+        tap(210, 610);
+        settleAndRender(1080, 2160);
+        tap(790, 560);
+        settleAndRender(1080, 2160);
+        tap(300, 1100);
+        layout(2160, 1080);
+        settleAndRender(2160, 1080);
+
+        ToneListener listener = new ToneListener();
+        view.setListener(listener);
+        tap(1313, 411);
+
+        assertEquals("One physical tap must emit exactly one tone change", 1, listener.changes);
+        assertTrue("The first tap must move HIGH to LOW", !listener.highTape);
     }
 
     @Test
@@ -487,6 +588,25 @@ public class WalkTapeViewRenderTest {
         @Override public void onToneChanged(boolean highTape) { }
     }
 
+    private static final class ToneListener implements WalkTapeView.Listener {
+        int changes;
+        boolean highTape = true;
+
+        @Override public void onImportRequested() { }
+        @Override public void onTrackSelected(CatalogModels.Album album, CatalogModels.Track track) { }
+        @Override public void onReturnToPlayer() { }
+        @Override public void onPlayPauseRequested() { }
+        @Override public void onStopRequested() { }
+        @Override public void onSkipRequested(int direction) { }
+        @Override public void onSeekRequested(float fraction) { }
+        @Override public void onExitPlayer() { }
+        @Override public void onHotlineChanged(boolean active) { }
+        @Override public void onToneChanged(boolean enabled) {
+            changes++;
+            highTape = enabled;
+        }
+    }
+
     private static final class MiniPlayerListener implements WalkTapeView.Listener {
         int trackLoads;
         int playerReturns;
@@ -524,6 +644,33 @@ public class WalkTapeViewRenderTest {
                                                 CatalogModels.Track track,
                                                 boolean forceRefresh) {
             requests++;
+        }
+    }
+
+    private static final class MachineListener implements WalkTapeView.Listener {
+        int profileChanges;
+        int tapeProfileChanges;
+        int hotlineChanges;
+        TapeMachineProfile lastProfile;
+        TapeStockProfile lastTapeProfile;
+
+        @Override public void onImportRequested() { }
+        @Override public void onTrackSelected(CatalogModels.Album album, CatalogModels.Track track) { }
+        @Override public void onReturnToPlayer() { }
+        @Override public void onPlayPauseRequested() { }
+        @Override public void onStopRequested() { }
+        @Override public void onSkipRequested(int direction) { }
+        @Override public void onSeekRequested(float fraction) { }
+        @Override public void onExitPlayer() { }
+        @Override public void onHotlineChanged(boolean active) { hotlineChanges++; }
+        @Override public void onToneChanged(boolean highTape) { }
+        @Override public void onMachineProfileChanged(TapeMachineProfile profile) {
+            profileChanges++;
+            lastProfile = profile;
+        }
+        @Override public void onTapeProfileChanged(TapeStockProfile profile) {
+            tapeProfileChanges++;
+            lastTapeProfile = profile;
         }
     }
 }

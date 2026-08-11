@@ -3,16 +3,18 @@ package com.yqdscott.walktape;
 import java.util.Arrays;
 
 /**
- * Real-time stereo model of a Sony TPS-L2 and a well-used Type-I cassette.
+ * Real-time stereo model of a Sony TPS-L2, with a legacy self-contained Type-I path.
  *
  * <p>The public Walkman Archive traces have been digitised into a smooth LOW response and the
  * measured HIGH-minus-LOW tone contour.  The same source reports 0.219% RMS wow/flutter and a
  * -67 dB analyser noise reference with a broad 8-9 kHz mound.  Those measurements still do not
  * describe every magnetic and mechanical non-linearity, so the renderer combines the measured
  * transfer targets with a conservative tape, head and transport model in one continuous signal
- * path rather than adding decorative sound effects.</p>
+ * path rather than adding decorative sound effects. Production playback disables this class's
+ * legacy media blocks and places an independent {@link TapeMediumDsp} before the unchanged
+ * machine response, transport and output stage.</p>
  */
-public final class TpsL2Dsp {
+public final class TpsL2Dsp implements TapeMachineDsp {
 
     private static final double TWO_PI = Math.PI * 2.0;
 
@@ -45,6 +47,7 @@ public final class TpsL2Dsp {
     private final boolean transportEnabled;
     private final boolean hissEnabled;
     private final boolean saturationEnabled;
+    private final boolean machineStageEnabled;
     private final float[] transportSine = new float[TRANSPORT_HZ.length];
     private final float[] transportCosine = new float[TRANSPORT_HZ.length];
     private final float[] transportStepSine = new float[TRANSPORT_HZ.length];
@@ -101,6 +104,16 @@ public final class TpsL2Dsp {
              boolean transportEnabled,
              boolean hissEnabled,
              boolean saturationEnabled) {
+        this(sampleRate, noiseSeed, transportEnabled, hissEnabled, saturationEnabled, false);
+    }
+
+    /** Machine-only production path keeps the TPS mechanics/electronics but omits baked-in tape. */
+    TpsL2Dsp(int sampleRate,
+             long noiseSeed,
+             boolean transportEnabled,
+             boolean hissEnabled,
+             boolean saturationEnabled,
+             boolean machineStageEnabled) {
         if (sampleRate < 8_000) {
             throw new IllegalArgumentException("Unsupported sample rate: " + sampleRate);
         }
@@ -108,6 +121,7 @@ public final class TpsL2Dsp {
         this.transportEnabled = transportEnabled;
         this.hissEnabled = hissEnabled;
         this.saturationEnabled = saturationEnabled;
+        this.machineStageEnabled = machineStageEnabled;
         camTransport = new CamTransport(sampleRate);
         startupDecay = (float) Math.exp(-TRANSPORT_CONTROL_STRIDE
                 / (sampleRate * STARTUP_TIME_CONSTANT_SECONDS));
@@ -185,11 +199,13 @@ public final class TpsL2Dsp {
         reset();
     }
 
+    @Override
     public void setHighTape(boolean enabled) {
         highTape = enabled;
     }
 
     /** Clears all magnetic, transport and filter history after loading or seeking. */
+    @Override
     public void reset() {
         Arrays.fill(delayLeft, 0f);
         Arrays.fill(delayRight, 0f);
@@ -232,6 +248,7 @@ public final class TpsL2Dsp {
     }
 
     /** Processes {@code frameCount} interleaved stereo float frames in place. */
+    @Override
     public void process(float[] stereo, int frameCount) {
         if (frameCount < 0 || frameCount * 2 > stereo.length) {
             throw new IllegalArgumentException("Invalid stereo frame count");
@@ -317,7 +334,7 @@ public final class TpsL2Dsp {
                 right *= contactGain * 0.9985f;
             }
 
-            if (saturationEnabled) {
+            if (saturationEnabled || machineStageEnabled) {
                 float originalLeft = left;
                 float originalRight = right;
                 left = originalLeft * (1f - PROGRAM_CROSSTALK)
@@ -330,9 +347,13 @@ public final class TpsL2Dsp {
                 float mechanism = mechanicalBed.next();
                 left += noiseLeft.next(programEnvelope) + mechanism * 1.04f;
                 right += noiseRight.next(programEnvelope) + mechanism * 0.91f;
+            } else if (machineStageEnabled) {
+                float mechanism = mechanicalBed.next();
+                left += mechanism * 1.04f;
+                right += mechanism * 0.91f;
             }
 
-            if (saturationEnabled) {
+            if (saturationEnabled || machineStageEnabled) {
                 stereo[sample] = analogueOutputStage(left);
                 stereo[sample + 1] = analogueOutputStage(right);
             } else {

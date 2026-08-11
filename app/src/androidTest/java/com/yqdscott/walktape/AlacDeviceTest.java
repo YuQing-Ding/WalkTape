@@ -10,21 +10,24 @@ import android.media.MediaFormat;
 import android.net.Uri;
 import android.os.SystemClock;
 import android.provider.MediaStore;
+import android.util.Log;
 
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 
-import com.beatofthedrum.alacdecoder.AlacFrameDecoder;
+import com.beatofthedrum.alacdecoder.ParallelAlacFrameDecoder;
 
 import org.junit.Assume;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayDeque;
 
-/** Device-only proof that a real MediaStore ALAC file can be parsed and decoded without MediaCodec. */
+/** Device-only proof that the production ALAC pipeline stays ahead of a real MediaStore file. */
 @RunWith(AndroidJUnit4.class)
 public class AlacDeviceTest {
+    private static final String TAG = "WalkTapeAlacTest";
 
     @Test
     public void decodesARealAlacFileFromMediaStore() throws Exception {
@@ -57,39 +60,60 @@ public class AlacDeviceTest {
             ByteBuffer configView = codecData.duplicate();
             byte[] config = new byte[configView.remaining()];
             configView.get(config);
-            AlacFrameDecoder alac = new AlacFrameDecoder(config);
+            int packetCapacity = Math.max(256 * 1024,
+                    format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)
+                            ? format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE) + 16 : 0);
+            ParallelAlacFrameDecoder alac = new ParallelAlacFrameDecoder(
+                    config, 2, 12, packetCapacity);
             int bits = alac.getBitsPerSample();
             assertTrue(bits == 16 || bits == 24);
 
-            ByteBuffer packetBuffer = ByteBuffer.allocateDirect(256 * 1024);
-            byte[] packet = new byte[256 * 1024];
-            int[] decoded = new int[73_728];
+            ByteBuffer packetBuffer = ByteBuffer.allocateDirect(packetCapacity);
             byte[] pcm = new byte[73_728];
             long decodedBytes = 0L;
             int packets = 0;
+            int submitted = 0;
+            boolean inputEnded = false;
+            ArrayDeque<ParallelAlacFrameDecoder.Frame> pending = new ArrayDeque<>(12);
             long startedMs = SystemClock.elapsedRealtime();
-            while (packets < 200) {
-                packetBuffer.clear();
-                int packetSize = extractor.readSampleData(packetBuffer, 0);
-                if (packetSize < 0) {
-                    break;
+            try {
+                while (packets < 200) {
+                    while (!inputEnded && submitted < 200
+                            && pending.size() < alac.getSlotCount()) {
+                        packetBuffer.clear();
+                        int packetSize = extractor.readSampleData(packetBuffer, 0);
+                        if (packetSize < 0) {
+                            inputEnded = true;
+                            break;
+                        }
+                        packetBuffer.position(0);
+                        packetBuffer.limit(packetSize);
+                        pending.addLast(alac.submit(packetBuffer, packetSize,
+                                Math.max(0L, extractor.getSampleTime())));
+                        submitted++;
+                        extractor.advance();
+                    }
+                    if (pending.isEmpty()) {
+                        break;
+                    }
+                    ParallelAlacFrameDecoder.Frame frame = pending.removeFirst();
+                    int bytes = frame.awaitDecodedByteCount();
+                    assertTrue("Expected a decoded ALAC packet", bytes > 0);
+                    PlaybackController.packAlacPcm(frame.getDecodedSamples(), bytes,
+                            alac.getBytesPerSample(), pcm);
+                    decodedBytes += bytes;
+                    packets++;
+                    alac.recycle(frame);
                 }
-                assertTrue("ALAC packet exceeded the test buffer", packetSize <= packet.length);
-                packetBuffer.position(0);
-                packetBuffer.limit(packetSize);
-                packetBuffer.get(packet, 0, packetSize);
-
-                int bytes = alac.decode(packet, packetSize, decoded);
-                assertTrue("Expected a decoded ALAC packet", bytes > 0);
-                PlaybackController.packAlacPcm(
-                        decoded, bytes, alac.getBytesPerSample(), pcm);
-                decodedBytes += bytes;
-                packets++;
-                extractor.advance();
+            } finally {
+                alac.close();
             }
             long elapsedMs = Math.max(1L, SystemClock.elapsedRealtime() - startedMs);
             long audioMs = decodedBytes * 1_000L
                     / (alac.getSampleRate() * alac.getChannelCount() * alac.getBytesPerSample());
+            Log.i(TAG, "parallel decoded " + audioMs + " ms in " + elapsedMs
+                    + " ms, packets=" + packets + " rate=" + alac.getSampleRate()
+                    + " bits=" + bits);
             assertTrue("Expected multiple ALAC packets", packets >= 20);
             assertTrue("ALAC decoder must stay ahead of real-time playback: decoded "
                     + audioMs + " ms in " + elapsedMs + " ms", elapsedMs < audioMs);

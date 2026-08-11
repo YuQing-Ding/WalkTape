@@ -11,23 +11,25 @@ import android.media.MediaCodecList;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.Process;
 
-import com.beatofthedrum.alacdecoder.AlacFrameDecoder;
+import com.beatofthedrum.alacdecoder.ParallelAlacFrameDecoder;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.nio.ShortBuffer;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 
 /**
  * Decode-to-PCM transport. Every supported source is converted to stereo float PCM before it
- * reaches {@link AudioTrack}, allowing the TPS-L2 model to process the actual audible signal.
+ * reaches {@link AudioTrack}, allowing the selected machine model to process the audible signal.
  */
 public final class PlaybackController {
 
@@ -35,10 +37,13 @@ public final class PlaybackController {
     private static final int PCM_24_BIT_PACKED = 21;
     private static final int PCM_32_BIT = 22;
     private static final int AUDIO_PRIME_MS = 450;
+    private static final int TONE_CHANGE_PRIME_MS = 120;
     private static final int AUDIO_BUFFER_MS = 2_000;
     private static final int PCM_QUEUE_MS = 2_000;
     private static final int AUDIO_WRITE_FRAMES = 2_048;
     private static final long AUDIO_WRITER_JOIN_MS = 2_000L;
+    private static final int ALAC_DECODE_WORKERS = 2;
+    private static final int ALAC_PIPELINE_SLOTS = 12;
 
     public enum HotlineResult {
         STARTED,
@@ -68,6 +73,9 @@ public final class PlaybackController {
     private volatile CatalogModels.Track currentTrack;
     private volatile float ducking = 1f;
     private volatile boolean highTape = true;
+    private volatile TapeMachineProfile machineProfile =
+            TapeMachineProfile.sonyTpsL2Reference();
+    private volatile TapeStockProfile tapeProfile = TapeStockProfile.sonyChf1978();
 
     public PlaybackController(Context context, Listener listener) {
         appContext = context.getApplicationContext();
@@ -100,6 +108,8 @@ public final class PlaybackController {
         DecoderSession next = new DecoderSession(Uri.parse(track.contentUri), track.durationMs,
                 previous);
         next.setDucking(ducking);
+        next.setMachineProfile(machineProfile);
+        next.setTapeProfile(tapeProfile);
         next.setHighTape(highTape);
         session = next;
         next.start();
@@ -183,6 +193,36 @@ public final class PlaybackController {
         if (active != null) {
             active.setHighTape(enabled);
         }
+    }
+
+    public void setMachineProfile(TapeMachineProfile profile) {
+        TapeMachineProfile selected = profile == null
+                ? TapeMachineProfile.sonyTpsL2Reference()
+                : TapeMachineProfile.forId(profile.id);
+        machineProfile = selected;
+        DecoderSession active = session;
+        if (active != null) {
+            active.setMachineProfile(selected);
+        }
+    }
+
+    TapeMachineProfile getMachineProfileForTest() {
+        return machineProfile;
+    }
+
+    public void setTapeProfile(TapeStockProfile profile) {
+        TapeStockProfile selected = profile == null
+                ? TapeStockProfile.sonyChf1978()
+                : TapeStockProfile.forId(profile.id);
+        tapeProfile = selected;
+        DecoderSession active = session;
+        if (active != null) {
+            active.setTapeProfile(selected);
+        }
+    }
+
+    TapeStockProfile getTapeProfileForTest() {
+        return tapeProfile;
     }
 
     public synchronized void release() {
@@ -290,9 +330,14 @@ public final class PlaybackController {
         private volatile long fallbackPositionMs;
         private volatile float sessionDucking = 1f;
         private volatile boolean sessionHighTape;
+        private volatile TapeMachineProfile sessionProfile =
+                TapeMachineProfile.sonyTpsL2Reference();
+        private volatile TapeStockProfile sessionTapeProfile = TapeStockProfile.sonyChf1978();
         private volatile AudioTrack audioTrack;
         private volatile PcmWriter pcmWriter;
-        private volatile TpsL2Dsp dsp;
+        private volatile TapeMachineDsp dsp;
+        private volatile String dspProfileId;
+        private volatile String dspTapeProfileId;
         private volatile boolean outputStarted;
 
         private MediaExtractor extractor;
@@ -300,6 +345,8 @@ public final class PlaybackController {
         private String sourceMime;
         private String decoderName;
         private long pendingSeekUs = NO_SEEK;
+        private boolean pendingSeekPreservesDsp;
+        private boolean consumedSeekPreservesDsp;
         private long discardBeforeUs = NO_SEEK;
         private int inputSampleRate;
         private int outputSampleRate;
@@ -309,6 +356,7 @@ public final class PlaybackController {
         private volatile long playbackAnchorFrames;
         private volatile long mediaAnchorUs;
         private volatile long stereoFramesWritten;
+        private volatile int audioPrimeMs = AUDIO_PRIME_MS;
         private boolean preparedCallbackSent;
         private float[] stereoBuffer = new float[0];
         private float[] resampledBuffer = new float[0];
@@ -355,7 +403,7 @@ public final class PlaybackController {
                 if (isAlac(sourceMime)) {
                     // Pixel devices do not expose ALAC through MediaCodec. MediaExtractor still
                     // demuxes the M4A reliably, so decode its ALAC packets in software and feed
-                    // the same TPS-L2 renderer as every other format.
+                    // the same selected machine renderer as every other format.
                     decodeAlac(sourceFormat);
                 } else if (isRawPcm(sourceMime)) {
                     decodeRawPcm(sourceFormat);
@@ -434,8 +482,19 @@ public final class PlaybackController {
         }
 
         void seekTo(long positionMs) {
+            requestSeek(positionMs, AUDIO_PRIME_MS, false);
+        }
+
+        private void requestSeek(long positionMs, int primeMs, boolean preserveDsp) {
             synchronized (controlLock) {
+                boolean alreadyPending = pendingSeekUs != NO_SEEK;
                 pendingSeekUs = Math.max(0, positionMs) * 1_000L;
+                // A full machine/tape rebuild remains sticky if a HIGH/LOW update lands in the
+                // same UI frame. Otherwise the later lightweight request could accidentally turn
+                // the pending rebuild into a state-preserving seek.
+                pendingSeekPreservesDsp = alreadyPending
+                        ? pendingSeekPreservesDsp && preserveDsp : preserveDsp;
+                audioPrimeMs = Math.max(1, primeMs);
                 fallbackPositionMs = Math.max(0, positionMs);
                 playbackAnchorSet = false;
                 stereoFramesWritten = 0L;
@@ -456,6 +515,7 @@ public final class PlaybackController {
                     try {
                         output.pause();
                         output.flush();
+                        setOutputStartThreshold(output, outputSampleRate, primeMs);
                         outputStarted = false;
                     } catch (IllegalStateException ignored) {
                         // The worker reports a real error if the output is no longer usable.
@@ -478,10 +538,42 @@ public final class PlaybackController {
         }
 
         void setHighTape(boolean enabled) {
+            boolean changed = sessionHighTape != enabled;
             sessionHighTape = enabled;
-            TpsL2Dsp renderer = dsp;
+            TapeMachineDsp renderer = dsp;
             if (renderer != null) {
                 renderer.setHighTape(enabled);
+            }
+            if (changed && prepared && !finished && !stopRequested) {
+                // DSP runs several seconds ahead to survive screen-off scheduling. Re-render from
+                // the audible playhead so one physical switch press is heard immediately instead
+                // of waiting behind PCM that already contains the previous HIGH/LOW curve.
+                requestSeek(getPositionMs(), TONE_CHANGE_PRIME_MS, true);
+            }
+        }
+
+        void setMachineProfile(TapeMachineProfile profile) {
+            TapeMachineProfile selected = profile == null
+                    ? TapeMachineProfile.sonyTpsL2Reference()
+                    : TapeMachineProfile.forId(profile.id);
+            boolean changed = !selected.id.equals(sessionProfile.id);
+            sessionProfile = selected;
+            if (changed && prepared && !finished && !stopRequested) {
+                // Build the new renderer on the decoder thread, then re-enter at the audible
+                // playhead so no queued PCM from the previous machine remains audible.
+                requestSeek(getPositionMs(), TONE_CHANGE_PRIME_MS, false);
+            }
+        }
+
+        void setTapeProfile(TapeStockProfile profile) {
+            TapeStockProfile selected = profile == null
+                    ? TapeStockProfile.sonyChf1978()
+                    : TapeStockProfile.forId(profile.id);
+            boolean changed = !selected.id.equals(sessionTapeProfile.id);
+            sessionTapeProfile = selected;
+            if (changed && prepared && !finished && !stopRequested) {
+                // Re-enter at the audible playhead so queued PCM cannot mix two tape stocks.
+                requestSeek(getPositionMs(), TONE_CHANGE_PRIME_MS, false);
             }
         }
 
@@ -579,7 +671,7 @@ public final class PlaybackController {
         }
 
         private void decodeAlac(MediaFormat sourceFormat) throws Exception {
-            decoderName = "WalkTape ALAC software decoder";
+            decoderName = "WalkTape ALAC 2-core software decoder";
             ByteBuffer codecData = sourceFormat.getByteBuffer("csd-0");
             if (codecData == null || !codecData.hasRemaining()) {
                 throw new PlaybackFailure("这个 ALAC / M4A 文件缺少解码参数");
@@ -588,9 +680,14 @@ public final class PlaybackController {
             byte[] config = new byte[configView.remaining()];
             configView.get(config);
 
-            AlacFrameDecoder decoder;
+            int advertisedPacketBytes = formatInt(
+                    sourceFormat, MediaFormat.KEY_MAX_INPUT_SIZE, 0) + 16;
+            int inputCapacity = Math.max(256 * 1024, advertisedPacketBytes);
+            int queuedPacketCapacity = Math.max(32 * 1024, advertisedPacketBytes);
+            ParallelAlacFrameDecoder decoder;
             try {
-                decoder = new AlacFrameDecoder(config);
+                decoder = new ParallelAlacFrameDecoder(config, ALAC_DECODE_WORKERS,
+                        ALAC_PIPELINE_SLOTS, queuedPacketCapacity);
             } catch (IllegalArgumentException invalidConfig) {
                 throw new PlaybackFailure("不支持这个 ALAC / M4A："
                         + invalidConfig.getMessage(), invalidConfig);
@@ -603,56 +700,91 @@ public final class PlaybackController {
                     ? AudioFormat.ENCODING_PCM_16BIT : PCM_24_BIT_PACKED;
             configureOutput(sampleRate, channels, encoding);
 
-            // jALD's maximum decoded packet is 73,728 bytes. Its 16-bit output stores one
-            // signed sample per int; its 24-bit output stores one PCM byte per int.
-            int[] decoded = new int[73_728];
-            byte[] compressed = new byte[256 * 1024];
-            int inputCapacity = Math.max(256 * 1024,
-                    formatInt(sourceFormat, MediaFormat.KEY_MAX_INPUT_SIZE, 0) + 16);
             ByteBuffer source = ByteBuffer.allocateDirect(inputCapacity);
+            ArrayDeque<ParallelAlacFrameDecoder.Frame> pending = new ArrayDeque<>(
+                    ALAC_PIPELINE_SLOTS);
+            boolean inputEnded = false;
 
-            while (!stopRequested) {
-                waitWhilePaused();
-                long seekUs = consumeSeek();
-                if (seekUs != NO_SEEK) {
-                    extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
-                    resetAfterSeek(seekUs);
-                }
-                if (stopRequested || paused) {
-                    continue;
-                }
-
-                rejectEncryptedSample();
-                source.clear();
-                int packetSize = extractor.readSampleData(source, 0);
-                if (packetSize < 0) {
-                    if (waitForAudioDrain()) {
-                        return;
+            try {
+                while (!stopRequested) {
+                    waitWhilePaused();
+                    long seekUs = consumeSeek();
+                    if (seekUs != NO_SEEK) {
+                        // Extractor has already been read ahead. Retire every old-generation frame
+                        // before repositioning so a scrub/profile change cannot leak stale PCM.
+                        decoder.close();
+                        pending.clear();
+                        extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                        resetAfterSeek(seekUs);
+                        decoder = new ParallelAlacFrameDecoder(config, ALAC_DECODE_WORKERS,
+                                ALAC_PIPELINE_SLOTS, queuedPacketCapacity);
+                        inputEnded = false;
                     }
-                    continue;
-                }
-                if (packetSize > source.capacity()) {
-                    throw new PlaybackFailure("ALAC 压缩帧超过了解码缓冲区");
-                }
-                if (compressed.length < packetSize) {
-                    compressed = new byte[Math.max(packetSize, compressed.length * 2)];
-                }
-                source.position(0);
-                source.limit(packetSize);
-                source.get(compressed, 0, packetSize);
+                    if (stopRequested || paused) {
+                        continue;
+                    }
 
-                int byteCount;
-                try {
-                    byteCount = decoder.decode(compressed, packetSize, decoded);
-                } catch (RuntimeException decodeFailure) {
-                    throw new PlaybackFailure("ALAC 音频帧解码失败", decodeFailure);
+                    // ALAC packets are independent. Keep a fixed look-ahead window full while two
+                    // decoder instances process consecutive frames on separate cores. Consumption
+                    // remains strictly in MediaExtractor order, so PCM and timestamps are stable.
+                    while (!inputEnded && pending.size() < decoder.getSlotCount()
+                            && !stopRequested && !paused && !hasPendingSeek()) {
+                        rejectEncryptedSample();
+                        source.clear();
+                        int packetSize = extractor.readSampleData(source, 0);
+                        if (packetSize < 0) {
+                            inputEnded = true;
+                            break;
+                        }
+                        if (packetSize > source.capacity()) {
+                            throw new PlaybackFailure("ALAC 压缩帧超过了解码缓冲区");
+                        }
+                        long presentationUs = Math.max(0L, extractor.getSampleTime());
+                        source.position(0);
+                        source.limit(packetSize);
+                        pending.addLast(decoder.submit(source, packetSize, presentationUs));
+                        extractor.advance();
+                    }
+
+                    if (hasPendingSeek()) {
+                        continue;
+                    }
+                    if (pending.isEmpty()) {
+                        if (inputEnded) {
+                            if (waitForAudioDrain()) {
+                                return;
+                            }
+                            inputEnded = false;
+                        }
+                        continue;
+                    }
+
+                    ParallelAlacFrameDecoder.Frame frame = pending.removeFirst();
+                    try {
+                        int byteCount;
+                        try {
+                            byteCount = frame.awaitDecodedByteCount();
+                        } catch (RuntimeException decodeFailure) {
+                            throw new PlaybackFailure("ALAC 音频帧解码失败", decodeFailure);
+                        }
+                        int[] decoded = frame.getDecodedSamples();
+                        int maximumBytes = bytesPerSample == 2
+                                ? decoded.length * 2 : decoded.length;
+                        if (byteCount <= 0 || byteCount > maximumBytes) {
+                            throw new PlaybackFailure("ALAC 解码器返回了异常大小的 PCM 数据");
+                        }
+                        if (!hasPendingSeek()) {
+                            writeAlacPcm(decoded, byteCount, bytesPerSample, channels,
+                                    frame.getPresentationTimeUs());
+                        }
+                    } finally {
+                        if (frame.isReady()) {
+                            decoder.recycle(frame);
+                        }
+                    }
                 }
-                if (byteCount <= 0 || byteCount > decoded.length) {
-                    throw new PlaybackFailure("ALAC 解码器返回了异常大小的 PCM 数据");
-                }
-                long presentationUs = Math.max(0L, extractor.getSampleTime());
-                writeAlacPcm(decoded, byteCount, bytesPerSample, channels, presentationUs);
-                extractor.advance();
+            } finally {
+                decoder.close();
             }
         }
 
@@ -825,17 +957,22 @@ public final class PlaybackController {
                 throw new PlaybackFailure("AudioTrack 初始化失败");
             }
 
+            setOutputStartThreshold(output, renderSampleRate, AUDIO_PRIME_MS);
             inputSampleRate = sampleRate;
             outputSampleRate = renderSampleRate;
             outputChannels = channels;
             outputEncoding = encoding;
             rateConverter = sampleRate == renderSampleRate
                     ? null : new PcmRateConverter(sampleRate, renderSampleRate);
-            TpsL2Dsp renderer = new TpsL2Dsp(renderSampleRate);
+            TapeMachineDsp renderer = TapeMachineDspFactory.create(
+                    sessionProfile, sessionTapeProfile, renderSampleRate);
             renderer.setHighTape(sessionHighTape);
             dsp = renderer;
+            dspProfileId = sessionProfile.id;
+            dspTapeProfileId = sessionTapeProfile.id;
             audioTrack = output;
             outputStarted = false;
+            audioPrimeMs = AUDIO_PRIME_MS;
             output.setVolume(sessionDucking);
             PcmWriter writer = new PcmWriter(output, renderSampleRate);
             pcmWriter = writer;
@@ -851,7 +988,7 @@ public final class PlaybackController {
                                            int bufferBytes) {
             // Do not request PERFORMANCE_MODE_POWER_SAVING here. Pixel routes that request to a
             // deep-buffer path and down-clocks the CPU aggressively enough that a sustained
-            // 192 kHz source can outrun this realtime TPS-L2 renderer after thermal settling.
+            // 192 kHz source can outrun a realtime tape renderer after thermal settling.
             return new AudioTrack.Builder()
                     .setAudioAttributes(new AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -865,6 +1002,18 @@ public final class PlaybackController {
                     .setBufferSizeInBytes(bufferBytes)
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build();
+        }
+
+        private void setOutputStartThreshold(AudioTrack output,
+                                             int sampleRate,
+                                             int primeMs) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || output == null
+                    || sampleRate <= 0) {
+                return;
+            }
+            int requestedFrames = Math.max(1, sampleRate * Math.max(1, primeMs) / 1_000);
+            int capacityFrames = output.getBufferCapacityInFrames();
+            output.setStartThresholdInFrames(Math.min(requestedFrames, capacityFrames));
         }
 
         private void writePcm(ByteBuffer source,
@@ -1088,9 +1237,9 @@ public final class PlaybackController {
                                    int renderFrames,
                                    long firstAudibleUs) throws Exception {
             int requiredSamples = renderFrames * 2;
-            TpsL2Dsp renderer = dsp;
+            TapeMachineDsp renderer = dsp;
             if (renderer == null) {
-                throw new PlaybackFailure("TPS-L2 渲染器未初始化");
+                throw new PlaybackFailure("磁带机渲染器未初始化");
             }
             // A scrub can arrive while PCM is being converted. Do not spend a DSP pass or enqueue
             // stale audio on either side of that race.
@@ -1181,6 +1330,8 @@ public final class PlaybackController {
             synchronized (controlLock) {
                 long result = pendingSeekUs;
                 pendingSeekUs = NO_SEEK;
+                consumedSeekPreservesDsp = pendingSeekPreservesDsp;
+                pendingSeekPreservesDsp = false;
                 return result;
             }
         }
@@ -1196,11 +1347,27 @@ public final class PlaybackController {
             playbackAnchorSet = false;
             stereoFramesWritten = 0;
             fallbackPositionMs = seekUs / 1_000L;
-            TpsL2Dsp renderer = dsp;
+            TapeMachineDsp renderer = dsp;
+            TapeMachineProfile selectedProfile = sessionProfile;
+            TapeStockProfile selectedTapeProfile = sessionTapeProfile;
+            if (renderer == null || dspProfileId == null
+                    || !dspProfileId.equals(selectedProfile.id)
+                    || dspTapeProfileId == null
+                    || !dspTapeProfileId.equals(selectedTapeProfile.id)) {
+                renderer = TapeMachineDspFactory.create(selectedProfile,
+                        selectedTapeProfile, outputSampleRate);
+                dsp = renderer;
+                dspProfileId = selectedProfile.id;
+                dspTapeProfileId = selectedTapeProfile.id;
+                consumedSeekPreservesDsp = false;
+            }
             if (renderer != null) {
-                renderer.reset();
+                if (!consumedSeekPreservesDsp) {
+                    renderer.reset();
+                }
                 renderer.setHighTape(sessionHighTape);
             }
+            consumedSeekPreservesDsp = false;
             PcmRateConverter converter = rateConverter;
             if (converter != null) {
                 converter.reset();
@@ -1462,11 +1629,12 @@ public final class PlaybackController {
                             return;
                         }
                         stereoFramesWritten += result / 2L;
-                        long primeFrames = outputSampleRate * AUDIO_PRIME_MS / 1_000L;
+                        long primeFrames = outputSampleRate * audioPrimeMs / 1_000L;
                         if (!outputStarted && !paused && pendingSeekUs == NO_SEEK
                                 && playbackAnchorSet && stereoFramesWritten >= primeFrames) {
                             output.play();
                             outputStarted = true;
+                            audioPrimeMs = AUDIO_PRIME_MS;
                         }
                     }
                 }
@@ -1480,8 +1648,8 @@ public final class PlaybackController {
         }
 
         private void rejectEncryptedSample() throws PlaybackFailure {
-            if (extractor != null
-                    && (extractor.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_ENCRYPTED) != 0) {
+            if (extractor != null && isEncryptedSample(
+                    extractor.getSampleTrackIndex(), extractor.getSampleFlags())) {
                 throw new PlaybackFailure("这首歌带有 DRM/加密，无法作为本地磁带渲染");
             }
         }
@@ -1787,6 +1955,14 @@ public final class PlaybackController {
         return current >= origin ? current - origin : (1L << 32) - origin + current;
     }
 
+    static boolean isEncryptedSample(int sampleTrackIndex, int sampleFlags) {
+        // At end-of-stream MediaExtractor reports no current track. Some MP4/ALAC extractors also
+        // return -1 for flags there; bit-testing -1 used to manufacture a false DRM result exactly
+        // when automatic-next needed the completion callback.
+        return sampleTrackIndex >= 0
+                && (sampleFlags & MediaExtractor.SAMPLE_FLAG_ENCRYPTED) != 0;
+    }
+
     private static int chooseRenderSampleRate(int sourceSampleRate) {
         if (sourceSampleRate <= 48_000) {
             return sourceSampleRate;
@@ -1799,8 +1975,9 @@ public final class PlaybackController {
     /**
      * Streaming anti-alias FIR decimator for high-resolution sources.
      *
-     * <p>The TPS-L2 cannot reproduce content above 12 kHz, so running its nonlinear/mechanical
-     * model at 96/192 kHz wastes most of the phone's CPU on an inaudible band. This converter keeps
+     * <p>Neither reference machine reproduces content above 12.5 kHz, so running the nonlinear
+     * and mechanical model at 96/192 kHz wastes most of the phone's CPU on an inaudible band.
+     * This converter keeps
      * the complete machine bandwidth, rejects ultrasonic aliases, and preserves phase continuity
      * across decoder buffers.</p>
      */

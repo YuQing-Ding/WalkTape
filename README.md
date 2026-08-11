@@ -2,20 +2,21 @@
 
 WalkTape is an Android cassette-listening experience built around the physical rituals of a tape: choosing a case from a shelf, opening it, unfolding the J-card, selecting a track, and placing the tape into a period player.
 
-The current milestone rebuilds the original prototype's interface and playback transport. The first machine target is the 1979 Sony TPS-L2.
+The current milestone rebuilds the original prototype's interface, playback transport, and analogue signal chain around selectable physical machines and magnetic tape stocks.
 
 ## Current experience
 
-- A responsive cassette shelf with generated demo artwork and optional on-device albums
+- A responsive cassette shelf built automatically and incrementally from the device library
 - A two-part open case with an acrylic J-card tray and animated cassette
 - An unfolding J-card with liner notes, track list, lyrics, paper folds, and scrolling
 - A track-selection drawer that rotates into a landscape playback scene
-- A code-drawn TPS-L2-inspired player with moving reels, tape-pack progression, mechanical controls, HOT LINE ducking, and HIGH/LOW tone targets
+- Code-drawn Sony TPS-L2 and Aiwa HS-JX707 players with moving reels, tape-pack progression, physical controls, and machine-specific behaviour
 - Local MediaStore album grouping and embedded artwork loading
-- A stereo PCM playback engine for AAC/M4A, FLAC, MP3, WAV/PCM, Ogg/Vorbis, and Opus (subject to the device's installed codecs)
-- A realtime TPS-L2 reference renderer with digitized LOW/HIGH response curves, fractional-delay wow/flutter, servo/cam transport behavior, measured-spectrum hiss, and gentle tape saturation
+- A stereo PCM playback engine for AAC/M4A, ALAC/M4A, FLAC, MP3, WAV/PCM, Ogg/Vorbis, and Opus, including a bundled ALAC fallback
+- A selectable machine DSP layer with independent TPS-L2 and HS-JX707 response, transport, head, electronics, and mechanical-noise models
+- A separate magnetic-media layer for Sony CHF Type I, TDK SA Type II, and TDK MA-X Type IV, including 120/70 µs EQ, formulation-specific MOL/SOL, hysteretic saturation, programme-modulated particle noise, and coating wander
 
-The old experimental effects remain in the repository for comparison, but playback no longer uses them. Every decoded source now passes through `TpsL2Dsp` as interleaved stereo float PCM.
+Every decoded source is converted to interleaved stereo float PCM and passes through `TapeMediumDsp` before the selected machine renderer. Machine and tape can be switched live from the Signal Chain panel; both choices persist across launches.
 
 ## Build
 
@@ -38,7 +39,7 @@ app/build/reports/walktape-renders/
 
 ## Audio engine
 
-The implemented reference model and the remaining physical-unit calibration work are documented in [docs/TPS_L2_AUDIO_PLAN.md](docs/TPS_L2_AUDIO_PLAN.md). The public curve is now modeled, while the stricter “physical twin” badge remains reserved for repeatable capture matching across serviced units.
+The machine reference model and remaining physical-unit calibration work are documented in [docs/TPS_L2_AUDIO_PLAN.md](docs/TPS_L2_AUDIO_PLAN.md). The independent media model and its source data are documented in [docs/TAPE_MEDIA_MODEL.md](docs/TAPE_MEDIA_MODEL.md). The stricter “physical twin” badge remains reserved for repeatable capture matching across serviced machines and known tape samples.
 
 ## License
 

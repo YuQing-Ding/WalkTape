@@ -2,11 +2,19 @@ package com.yqdscott.walktape;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
 public class PlaybackControllerTest {
+
+    @Test
+    public void endOfStreamFlagsCannotMasqueradeAsDrm() {
+        assertFalse(PlaybackController.isEncryptedSample(-1, -1));
+        assertTrue(PlaybackController.isEncryptedSample(
+                0, android.media.MediaExtractor.SAMPLE_FLAG_ENCRYPTED));
+    }
 
     @Test
     public void packsSigned16BitAlacSamplesAsLittleEndianPcm() {
