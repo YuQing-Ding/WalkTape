@@ -312,6 +312,63 @@ public class PlaybackDeviceTest {
     }
 
     @Test
+    public void liveConditionChangeRebuildsHealthyUnitToleranceAtTheAudiblePlayhead()
+            throws Exception {
+        String requestedUri = InstrumentationRegistry.getArguments().getString("mediaUri");
+        Assume.assumeNotNull(requestedUri);
+        Uri uri = Uri.parse(requestedUri);
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        long durationMs = readDurationMs(context, uri);
+        CountDownLatch prepared = new CountDownLatch(1);
+        AtomicReference<String> error = new AtomicReference<>();
+        PlaybackController controller = new PlaybackController(context,
+                new PlaybackController.Listener() {
+                    @Override public void onPrepared(long value) { prepared.countDown(); }
+                    @Override public void onCompleted() { }
+                    @Override public void onError(String message) {
+                        error.set(message);
+                        prepared.countDown();
+                    }
+                });
+        try {
+            Field ducking = PlaybackController.class.getDeclaredField("ducking");
+            ducking.setAccessible(true);
+            ducking.setFloat(controller, 0f);
+            controller.loadAndPlay(new CatalogModels.Track(
+                    6L, "Condition switch check", durationMs, uri.toString(), ""));
+            assertTrue("Condition switch test did not prepare",
+                    prepared.await(12, TimeUnit.SECONDS));
+            assertNull(error.get(), error.get());
+            waitForPosition(controller, 800L, error, 10_000L);
+
+            long positionBefore = controller.getPositionMs();
+            int generationBefore = readPcmWriterGeneration(controller);
+            int underrunsBefore = readUnderrunCount(controller);
+            controller.setConditionProfile(MachineConditionProfile.livedIn());
+            waitForPosition(controller, positionBefore + 350L, error, 7_000L);
+
+            assertNull(error.get(), error.get());
+            Object renderer = readSessionField(controller, "dsp");
+            assertTrue(renderer instanceof CassetteSignalChainDsp);
+            MachineImperfectionDsp imperfection =
+                    ((CassetteSignalChainDsp) renderer).imperfectionRenderer();
+            assertTrue("LIVED-IN condition did not insert its tolerance renderer",
+                    imperfection != null);
+            assertEquals(MachineConditionProfile.LIVED_IN, imperfection.profile().id);
+            assertEquals(MachineConditionProfile.LIVED_IN,
+                    readSessionField(controller, "dspConditionProfileId"));
+            assertTrue("Old condition lookahead was not discarded",
+                    readPcmWriterGeneration(controller) >= generationBefore + 2);
+            assertTrue("Playback did not resume after the condition rebuild",
+                    controller.getPositionMs() >= positionBefore + 350L);
+            assertTrue("Condition change introduced repeated AudioTrack underruns",
+                    readUnderrunCount(controller) <= underrunsBefore + 1);
+        } finally {
+            controller.release();
+        }
+    }
+
+    @Test
     public void trackReplacementDoesNotRetainHistoryOrStutterLater() throws Exception {
         String requestedUri = InstrumentationRegistry.getArguments().getString("mediaUri");
         Assume.assumeNotNull(requestedUri);
@@ -400,6 +457,15 @@ public class PlaybackDeviceTest {
             String machineArgument = InstrumentationRegistry.getArguments().getString("machine");
             if (TapeMachineProfile.AIWA_HS_JX707.equals(machineArgument)) {
                 controller.setMachineProfile(TapeMachineProfile.aiwaHsJx707Reference());
+            } else if (TapeMachineProfile.SONY_WM_F2015.equals(machineArgument)) {
+                controller.setMachineProfile(TapeMachineProfile.sonyWmF2015Reference());
+            }
+            String conditionArgument =
+                    InstrumentationRegistry.getArguments().getString("condition");
+            if (MachineConditionProfile.LIVED_IN.equals(conditionArgument)) {
+                controller.setConditionProfile(MachineConditionProfile.livedIn());
+            } else if (MachineConditionProfile.NATURAL.equals(conditionArgument)) {
+                controller.setConditionProfile(MachineConditionProfile.natural());
             }
             controller.loadAndPlay(new CatalogModels.Track(
                     77L, "Sustained high-resolution check", durationMs, uri.toString(), ""));
@@ -432,6 +498,7 @@ public class PlaybackDeviceTest {
                     controller.getPositionMs() >= targetMs);
             int underrunsAfterRun = output.getUnderrunCount();
             Log.i(PLAYBACK_TAG, "sustained machine=" + controller.getMachineProfileForTest().id
+                    + " condition=" + controller.getConditionProfileForTest().id
                     + " source=" + uri
                     + " targetMs=" + targetMs
                     + " bufferFrames=" + output.getBufferCapacityInFrames()
@@ -588,6 +655,17 @@ public class PlaybackDeviceTest {
             ducking.setAccessible(true);
             ducking.setFloat(controller, 0f);
 
+            String machineArgument = InstrumentationRegistry.getArguments().getString("machine");
+            if (TapeMachineProfile.AIWA_HS_JX707.equals(machineArgument)) {
+                controller.setMachineProfile(TapeMachineProfile.aiwaHsJx707Reference());
+            } else if (TapeMachineProfile.SONY_WM_F2015.equals(machineArgument)) {
+                controller.setMachineProfile(TapeMachineProfile.sonyWmF2015Reference());
+            }
+
+            if (MachineConditionProfile.LIVED_IN.equals(
+                    InstrumentationRegistry.getArguments().getString("condition"))) {
+                controller.setConditionProfile(MachineConditionProfile.livedIn());
+            }
             Field viewField = MainActivity.class.getDeclaredField("walkTapeView");
             viewField.setAccessible(true);
             WalkTapeView view = (WalkTapeView) viewField.get(activity);
@@ -699,6 +777,15 @@ public class PlaybackDeviceTest {
             String machineArgument = InstrumentationRegistry.getArguments().getString("machine");
             if (TapeMachineProfile.AIWA_HS_JX707.equals(machineArgument)) {
                 controller.setMachineProfile(TapeMachineProfile.aiwaHsJx707Reference());
+            } else if (TapeMachineProfile.SONY_WM_F2015.equals(machineArgument)) {
+                controller.setMachineProfile(TapeMachineProfile.sonyWmF2015Reference());
+            }
+            String conditionArgument =
+                    InstrumentationRegistry.getArguments().getString("condition");
+            if (MachineConditionProfile.LIVED_IN.equals(conditionArgument)) {
+                controller.setConditionProfile(MachineConditionProfile.livedIn());
+            } else if (MachineConditionProfile.NATURAL.equals(conditionArgument)) {
+                controller.setConditionProfile(MachineConditionProfile.natural());
             }
 
             CatalogModels.Track track = new CatalogModels.Track(

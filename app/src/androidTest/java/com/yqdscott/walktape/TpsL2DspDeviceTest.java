@@ -132,14 +132,62 @@ public class TpsL2DspDeviceTest {
         TapeMachineDsp aiwaTypeTwo = TapeMachineDspFactory.create(
                 TapeMachineProfile.aiwaHsJx707Reference(),
                 TapeStockProfile.tdkSa1988(), sampleRate);
+        TapeMachineDsp aiwaDolbyC = TapeMachineDspFactory.create(
+                TapeMachineProfile.aiwaHsJx707Reference(),
+                TapeStockProfile.tdkSa1988(), sampleRate);
+        TapeMachineDsp d6cDolbyC = TapeMachineDspFactory.create(
+                TapeMachineProfile.sonyWmD6cReference(),
+                TapeStockProfile.tdkSa1988(), sampleRate);
+        TapeMachineDsp d6cTypeTwo = TapeMachineDspFactory.create(
+                TapeMachineProfile.sonyWmD6cReference(),
+                TapeStockProfile.tdkSa1988(), sampleRate);
+        TapeMachineDsp f2015TypeTwo = TapeMachineDspFactory.create(
+                TapeMachineProfile.sonyWmF2015Reference(),
+                TapeStockProfile.tdkSa1988(), sampleRate);
+        TapeMachineDsp sonyLivedIn = TapeMachineDspFactory.create(
+                TapeMachineProfile.sonyTpsL2Reference(),
+                TapeStockProfile.sonyChf1978(),
+                MachineConditionProfile.livedIn(), sampleRate);
+        TapeMachineDsp f2015LivedIn = TapeMachineDspFactory.create(
+                TapeMachineProfile.sonyWmF2015Reference(),
+                TapeStockProfile.tdkSa1988(),
+                MachineConditionProfile.livedIn(), sampleRate);
         aiwaTypeTwo.setHighTape(true);
+        aiwaDolbyC.setHighTape(true);
+        aiwaDolbyC.setDolbyMode(DolbyMode.C);
+        d6cDolbyC.setHighTape(true);
+        d6cDolbyC.setDolbyMode(DolbyMode.C);
+        d6cTypeTwo.setHighTape(true);
+        f2015TypeTwo.setHighTape(true);
         long sonyMs = benchmark("production-tps-chf", sonyFerric, block);
         long aiwaMs = benchmark("production-jx707-sa", aiwaTypeTwo, block);
+        long aiwaDolbyCMs = benchmark("production-jx707-sa-dolby-c", aiwaDolbyC, block);
+        long d6cMs = benchmark("production-wm-d6c-sa", d6cTypeTwo, block);
+        long d6cDolbyCMs = benchmark("production-wm-d6c-sa-dolby-c", d6cDolbyC, block);
+        long f2015Ms = benchmark("production-wm-f2015-sa", f2015TypeTwo, block);
+        long livedInMs = benchmark("production-tps-chf-lived-in", sonyLivedIn, block);
+        long f2015LivedInMs = benchmark(
+                "production-wm-f2015-sa-lived-in", f2015LivedIn, block);
 
         assertTrue("TPS-L2 × CHF needs at least 1.5x realtime headroom: " + sonyMs,
                 sonyMs < renderedAudioMs * 0.65);
         assertTrue("JX707 × SA needs at least 1.5x realtime headroom: " + aiwaMs,
                 aiwaMs < renderedAudioMs * 0.65);
+        assertTrue("JX707 × SA × Dolby C needs sustained realtime headroom: "
+                        + aiwaDolbyCMs,
+                aiwaDolbyCMs < renderedAudioMs * 0.85);
+        assertTrue("WM-D6C × SA × Dolby C needs sustained realtime headroom: "
+                        + d6cDolbyCMs,
+                d6cDolbyCMs < renderedAudioMs * 0.85);
+        assertTrue("WM-D6C × SA needs at least 1.5x realtime headroom: " + d6cMs,
+                d6cMs < renderedAudioMs * 0.65);
+        assertTrue("WM-F2015 × SA needs at least 1.5x realtime headroom: " + f2015Ms,
+                f2015Ms < renderedAudioMs * 0.65);
+        assertTrue("LIVED-IN condition needs at least 1.5x realtime headroom: " + livedInMs,
+                livedInMs < renderedAudioMs * 0.65);
+        assertTrue("WM-F2015 × SA × LIVED-IN needs at least 1.5x realtime headroom: "
+                        + f2015LivedInMs,
+                f2015LivedInMs < renderedAudioMs * 0.65);
     }
 
     @Test
@@ -175,6 +223,31 @@ public class TpsL2DspDeviceTest {
         long elapsed = Math.max(1L, SystemClock.elapsedRealtime() - started);
         long audioMs = (long) blocks * inputFrames * 1_000L / inputRate;
         Log.i(BENCHMARK_TAG, "192k-pipeline audioMs=" + audioMs + " elapsedMs=" + elapsed);
+
+        TapeMachineDsp d6cDolbyC = TapeMachineDspFactory.create(
+                TapeMachineProfile.sonyWmD6cReference(),
+                TapeStockProfile.tdkSa1988(), outputRate);
+        d6cDolbyC.setHighTape(true);
+        d6cDolbyC.setDolbyMode(DolbyMode.C);
+        converter.reset();
+        for (int warmup = 0; warmup < 12; warmup++) {
+            int frames = converter.process(input, inputFrames, output);
+            d6cDolbyC.process(output, frames);
+        }
+        converter.reset();
+        d6cDolbyC.reset();
+        long d6cStarted = SystemClock.elapsedRealtime();
+        for (int block = 0; block < blocks; block++) {
+            int frames = converter.process(input, inputFrames, output);
+            d6cDolbyC.process(output, frames);
+        }
+        long d6cElapsed = Math.max(1L,
+                SystemClock.elapsedRealtime() - d6cStarted);
+        Log.i(BENCHMARK_TAG, "192k-d6c-dolby-c audioMs=" + audioMs
+                + " elapsedMs=" + d6cElapsed);
+        assertTrue("192 kHz resample × WM-D6C × Dolby C must remain ahead of realtime: "
+                        + d6cElapsed,
+                d6cElapsed < audioMs * 0.92);
     }
 
     private static long benchmark(String name, TapeMachineDsp renderer, float[] template) {
@@ -193,4 +266,5 @@ public class TpsL2DspDeviceTest {
         Log.i(BENCHMARK_TAG, name + " audioMs=3072 elapsedMs=" + elapsed);
         return elapsed;
     }
+
 }

@@ -64,10 +64,16 @@ public final class WalkTapeView extends View {
 
         void onToneChanged(boolean highTape);
 
+        default void onDolbyModeChanged(DolbyMode mode) {
+        }
+
         default void onMachineProfileChanged(TapeMachineProfile profile) {
         }
 
         default void onTapeProfileChanged(TapeStockProfile profile) {
+        }
+
+        default void onConditionProfileChanged(MachineConditionProfile profile) {
         }
 
         default void onAlbumArtworkRequested(long albumId) {
@@ -128,6 +134,7 @@ public final class WalkTapeView extends View {
     private static final String ACTION_FORWARD = "forward";
     private static final String ACTION_HOTLINE = "hotline";
     private static final String ACTION_TONE = "tone";
+    private static final String ACTION_DOLBY = "dolby";
     private static final String ACTION_SEEK = "seek";
     private static final String ACTION_MINI_PLAYER = "mini_player";
     private static final String ACTION_MINI_PLAY = "mini_play";
@@ -135,11 +142,14 @@ public final class WalkTapeView extends View {
     private static final String ACTION_INFO_FLIP = "info_flip";
     private static final String ACTION_INFO_FLIP_BACK = "info_flip_back";
     private static final String ACTION_INFO_TRACK = "info_track";
+    private static final String ACTION_PLAYER_INFO_TOGGLE = "player_info_toggle";
+    private static final String ACTION_PLAYER_VIEW_LOCK = "player_view_lock";
     private static final String ACTION_SETTINGS = "settings";
     private static final String ACTION_SETTINGS_CLOSE = "settings_close";
     private static final String ACTION_SETTINGS_SECTION = "settings_section";
     private static final String ACTION_MACHINE_PROFILE = "machine_profile";
     private static final String ACTION_TAPE_PROFILE = "tape_profile";
+    private static final String ACTION_CONDITION_PROFILE = "condition_profile";
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
     private final Paint texturePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -149,6 +159,7 @@ public final class WalkTapeView extends View {
     private final ArrayList<HitTarget> hitTargets = new ArrayList<>();
     private TapeMachineProfile profile = TapeMachineProfile.sonyTpsL2Reference();
     private TapeStockProfile tapeProfile = TapeStockProfile.sonyChf1978();
+    private MachineConditionProfile conditionProfile = MachineConditionProfile.calibrated();
     private final LinkedHashMap<Long, Bitmap> residentArtwork =
             new LinkedHashMap<>(MAX_RESIDENT_ARTWORK + 1, 0.75f, true);
     private final Set<Long> requestedAlbumArtwork = new HashSet<>();
@@ -187,6 +198,7 @@ public final class WalkTapeView extends View {
     private boolean hotline;
     private boolean hotlinePressActive;
     private boolean highTape = true;
+    private DolbyMode dolbyMode = DolbyMode.OFF;
 
     // The machine chassis is almost entirely static but used to be rebuilt on every reel frame.
     // Cache it as one opaque frame, then redraw only the two reels and the live information panel.
@@ -221,6 +233,12 @@ public final class WalkTapeView extends View {
     private float settingsProgress;
     private float settingsTarget;
     private int settingsSection;
+    private float playerInfoReveal = 1f;
+    private float playerInfoTarget = 1f;
+    private boolean playerViewLocked;
+    private float audioMeterTarget;
+    private float audioMeterDisplay;
+    private float audioMeterHoldSeconds;
     private final RectF playerInfoBounds = new RectF();
     private float reelAngle;
     private float buttonPress;
@@ -291,6 +309,11 @@ public final class WalkTapeView extends View {
             hotline = false;
             hotlinePressActive = false;
         }
+        if (!profile.isSonyWmD6c()) {
+            audioMeterTarget = 0f;
+            audioMeterDisplay = 0f;
+            audioMeterHoldSeconds = 0f;
+        }
         recyclePlayerStaticFrame();
         playerCacheFailedWidth = 0;
         playerCacheFailedHeight = 0;
@@ -319,6 +342,24 @@ public final class WalkTapeView extends View {
         return tapeProfile;
     }
 
+    public void setConditionProfile(MachineConditionProfile requestedProfile) {
+        MachineConditionProfile selected = requestedProfile == null
+                ? MachineConditionProfile.calibrated()
+                : MachineConditionProfile.forId(requestedProfile.id);
+        if (selected.id.equals(conditionProfile.id)) {
+            return;
+        }
+        conditionProfile = selected;
+        recyclePlayerStaticFrame();
+        playerCacheFailedWidth = 0;
+        playerCacheFailedHeight = 0;
+        invalidate();
+    }
+
+    public MachineConditionProfile getConditionProfile() {
+        return conditionProfile;
+    }
+
     public void setHighTape(boolean enabled) {
         if (highTape == enabled) {
             return;
@@ -326,6 +367,20 @@ public final class WalkTapeView extends View {
         highTape = enabled;
         recyclePlayerStaticFrame();
         invalidate();
+    }
+
+    public void setDolbyMode(DolbyMode mode) {
+        DolbyMode selected = mode == null ? DolbyMode.OFF : mode;
+        if (dolbyMode == selected) {
+            return;
+        }
+        dolbyMode = selected;
+        recyclePlayerStaticFrame();
+        invalidate();
+    }
+
+    public DolbyMode getDolbyMode() {
+        return dolbyMode;
     }
 
     public void setAlbums(List<CatalogModels.Album> newAlbums, boolean fromDevice) {
@@ -642,6 +697,21 @@ public final class WalkTapeView extends View {
         invalidate();
     }
 
+    /** Supplies post-DSP peaks. The D6C detector follows the louder instantaneous channel. */
+    public void setAudioMeterLevels(float leftPeak, float rightPeak) {
+        float target = profile.isSonyWmD6c()
+                ? clamp(Math.max(Math.abs(leftPeak), Math.abs(rightPeak)), 0f, 1f)
+                : 0f;
+        if (Math.abs(target - audioMeterTarget) < 0.001f) {
+            return;
+        }
+        audioMeterTarget = target;
+        if (target >= audioMeterDisplay) {
+            audioMeterHoldSeconds = 0.070f;
+        }
+        invalidate();
+    }
+
     public CatalogModels.Album getSelectedAlbum() {
         return selectedAlbum;
     }
@@ -702,6 +772,13 @@ public final class WalkTapeView extends View {
             infoFlipTarget = 0f;
             animateNextFrame();
             announceForAccessibility("返回播放信息");
+            return true;
+        }
+        if (scene == Scene.PLAYER && (playerInfoTarget < 0.5f || playerInfoReveal < 0.99f)) {
+            playerInfoTarget = 1f;
+            recyclePlayerStaticFrame();
+            animateNextFrame();
+            announceForAccessibility("显示播放信息");
             return true;
         }
         if (scene == Scene.PLAYER) {
@@ -790,6 +867,24 @@ public final class WalkTapeView extends View {
         float settingsOld = settingsProgress;
         settingsProgress = approach(settingsProgress, settingsTarget, dt * 5.2f);
         moving |= settingsOld != settingsProgress;
+
+        float playerInfoOld = playerInfoReveal;
+        playerInfoReveal = approach(playerInfoReveal, playerInfoTarget, dt * 5.2f);
+        moving |= playerInfoOld != playerInfoReveal;
+
+        float meterOld = audioMeterDisplay;
+        if (audioMeterTarget >= audioMeterDisplay) {
+            audioMeterDisplay = approach(audioMeterDisplay, audioMeterTarget, dt * 28f);
+            audioMeterHoldSeconds = 0.070f;
+        } else if (audioMeterHoldSeconds > 0f) {
+            audioMeterHoldSeconds = Math.max(0f, audioMeterHoldSeconds - dt);
+        } else {
+            audioMeterDisplay = approach(audioMeterDisplay, audioMeterTarget, dt * 3.6f);
+        }
+        if (Math.abs(audioMeterDisplay) < 0.0001f && audioMeterTarget == 0f) {
+            audioMeterDisplay = 0f;
+        }
+        moving |= meterOld != audioMeterDisplay;
 
         float pressOld = buttonPress;
         buttonPress = approach(buttonPress, pressedAction == null ? 0f : 1f, dt * 10f);
@@ -1603,12 +1698,20 @@ public final class WalkTapeView extends View {
 
         float margin = dp(14);
         float infoWidth = clamp(width * 0.30f, dp(205), dp(330));
-        RectF info = new RectF(width - infoWidth - margin, margin,
+        RectF restingInfo = new RectF(width - infoWidth - margin, margin,
                 width - margin, height - margin);
+        float panelReveal = easeInOut(playerInfoReveal);
+        float panelTravel = infoWidth + margin + dp(18);
+        RectF info = new RectF(restingInfo);
+        info.offset(panelTravel * (1f - panelReveal), 0f);
         playerInfoBounds.set(info);
-        float availableDeviceWidth = info.left - margin * 2;
-        float deviceHeight = Math.min(height - margin * 2, availableDeviceWidth / 1.56f);
-        float deviceWidth = deviceHeight * 1.56f;
+        float normalDeviceWidth = restingInfo.left - margin * 2;
+        float expandedDeviceWidth = width - margin * 2;
+        float availableDeviceWidth = lerp(expandedDeviceWidth, normalDeviceWidth, panelReveal);
+        float machineAspect = profile.isSonyWmD6c() ? 1.90f : 1.56f;
+        float deviceHeight = Math.min(height - margin * 2,
+                availableDeviceWidth / machineAspect);
+        float deviceWidth = deviceHeight * machineAspect;
         RectF device = new RectF(
                 margin + Math.max(0, (availableDeviceWidth - deviceWidth) / 2f),
                 (height - deviceHeight) / 2f,
@@ -1616,7 +1719,9 @@ public final class WalkTapeView extends View {
                 (height - deviceHeight) / 2f + deviceHeight);
 
         float reveal = easeOut(sceneReveal);
-        boolean cacheable = reveal >= 0.999f && pressedAction == null && buttonPress <= 0.001f;
+        boolean infoSettled = playerInfoReveal <= 0.001f || playerInfoReveal >= 0.999f;
+        boolean cacheable = reveal >= 0.999f && infoSettled
+                && pressedAction == null && buttonPress <= 0.001f;
         if (cacheable && drawCachedPlayerMachine(canvas, width, height, device)) {
             // The cached frame contains the shell, artwork and controls. Only the moving tape
             // packs/spokes and their glass reflection need to be painted at transport cadence.
@@ -1629,8 +1734,15 @@ public final class WalkTapeView extends View {
             drawSelectedMachine(canvas, device);
             canvas.restore();
         }
+        drawLiveMachineOverlays(canvas, device);
+        // The broad body action is registered first; physical transport/selector controls added
+        // afterwards take priority because hit testing walks the list in reverse.
+        addHit(ACTION_PLAYER_INFO_TOGGLE, device, -1);
         addPlayerMachineHits(device);
-        drawPlayerInfo(canvas, info, reveal);
+        if (panelReveal > 0.001f) {
+            drawPlayerInfo(canvas, info, reveal * panelReveal);
+        }
+        drawPlayerViewLock(canvas, device);
     }
 
     private void drawPlayerBackdrop(Canvas canvas, int width, int height) {
@@ -1640,7 +1752,9 @@ public final class WalkTapeView extends View {
         canvas.drawRect(0, 0, width, height, paint);
         paint.setShader(null);
         drawAmbientGlow(canvas, width * 0.3f, height * 0.34f, width * 0.58f,
-                profile.isAiwaHsJx707() ? 0x1d9d8060 : 0x1d6593a1);
+                profile.isSonyWmD6c() ? 0x1f9e4933
+                        : profile.isAiwaHsJx707() ? 0x1d9d8060
+                        : profile.isSonyWmF2015() ? 0x1b8b9295 : 0x1d6593a1);
         drawFineGrain(canvas, 0xff4e504b, 0.11f);
     }
 
@@ -1698,9 +1812,12 @@ public final class WalkTapeView extends View {
                 ? 0 : System.identityHashCode(selectedAlbum.artwork));
         signature = signature * 31L + (playing ? 1 : 0);
         signature = signature * 31L + (highTape ? 1 : 0);
+        signature = signature * 31L + dolbyMode.ordinal();
         signature = signature * 31L + (hotline ? 1 : 0);
         signature = signature * 31L + profile.id.hashCode();
         signature = signature * 31L + tapeProfile.id.hashCode();
+        signature = signature * 31L + conditionProfile.id.hashCode();
+        signature = signature * 31L + (playerInfoTarget < 0.5f ? 1 : 0);
         return signature;
     }
 
@@ -1726,7 +1843,43 @@ public final class WalkTapeView extends View {
         return infoFlipProgress;
     }
 
+    boolean playerInfoHiddenForTest() {
+        return playerInfoTarget < 0.5f;
+    }
+
+    boolean playerViewLockedForTest() {
+        return playerViewLocked;
+    }
+
+    float audioMeterDisplayForTest() {
+        return audioMeterDisplay;
+    }
+
+    static int d6cMeterSegmentCountForTest(float linearPeak) {
+        if (!(linearPeak > 0f) || !Float.isFinite(linearPeak)) {
+            return 0;
+        }
+        // Full-scale PCM represents +6 dB on the five-step D6C scale; consequently its
+        // documented 0 dB reference sits at -6 dBFS with symmetric digital headroom.
+        float analogueDb = 20f * (float) Math.log10(Math.min(1f, linearPeak)) + 6f;
+        float[] thresholds = {-10f, -5f, 0f, 3f, 6f};
+        int count = 0;
+        for (float threshold : thresholds) {
+            if (analogueDb + 0.0001f >= threshold) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     private void drawPlayerReels(Canvas canvas, RectF body) {
+        if (profile.isSonyWmD6c()) {
+            RectF window = sonyWmD6cWindow(body);
+            RectF visibleTape = inset(window, dp(5));
+            drawDynamicCassetteReels(canvas, visibleTape);
+            drawPlayerWindowReflection(canvas, window);
+            return;
+        }
         float faceLeft = body.left + body.width() * 0.075f;
         float faceTop = body.top + body.height() * 0.075f;
         float faceRight = body.right - body.width() * 0.108f;
@@ -1759,6 +1912,61 @@ public final class WalkTapeView extends View {
         // Reapply the subtle window sheen after the dynamic reel layer. It is intentionally very
         // faint; avoiding a mutable-Path clip here keeps recording/hardware canvases consistent.
         drawPlayerWindowReflection(canvas, window);
+    }
+
+    private void drawDynamicCassetteReels(Canvas canvas, RectF visibleTape) {
+        float shellInset = visibleTape.width() * 0.067f;
+        RectF label = new RectF(visibleTape.left + shellInset,
+                visibleTape.top + visibleTape.height() * 0.075f,
+                visibleTape.right - shellInset,
+                visibleTape.bottom - visibleTape.height() * 0.14f);
+        float reelY = label.top + label.height() * 0.43f;
+        float reelRadius = Math.min(label.height() * 0.22f, label.width() * 0.115f);
+        float leftReelX = label.left + label.width() * 0.28f;
+        float rightReelX = label.right - label.width() * 0.28f;
+        float played = durationMs <= 0 ? 0.42f
+                : clamp(positionMs / (float) durationMs, 0f, 1f);
+        drawReel(canvas, leftReelX, reelY, reelRadius,
+                reelAngle, lerp(0.86f, 0.48f, played), true);
+        drawReel(canvas, rightReelX, reelY, reelRadius,
+                -reelAngle * 1.04f, lerp(0.48f, 0.86f, played), true);
+    }
+
+    private void drawLiveMachineOverlays(Canvas canvas, RectF body) {
+        if (profile.isSonyWmD6c()) {
+            drawSonyWmD6cMeterLights(canvas, body);
+        }
+    }
+
+    private void drawPlayerViewLock(Canvas canvas, RectF body) {
+        float lockWidth = dp(playerViewLocked ? 62f : 52f);
+        float lockHeight = dp(23f);
+        RectF lock = new RectF(body.right - lockWidth - dp(9), body.top + dp(8),
+                body.right - dp(9), body.top + dp(8) + lockHeight);
+        boolean pressed = ACTION_PLAYER_VIEW_LOCK.equals(pressedAction);
+        paint.setColor(playerViewLocked ? (pressed ? 0xdde95c2c : 0xb8c84e29)
+                : (pressed ? 0x9a242523 : 0x66171918));
+        canvas.drawRoundRect(lock, lock.height() * 0.5f, lock.height() * 0.5f, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(0.75f));
+        paint.setColor(playerViewLocked ? 0xfff0b29b : 0x769e998e);
+        canvas.drawRoundRect(lock, lock.height() * 0.5f, lock.height() * 0.5f, paint);
+
+        float iconX = lock.left + dp(10.5f);
+        float iconY = lock.centerY() + dp(1f);
+        paint.setStrokeWidth(dp(1.15f));
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        canvas.drawArc(iconX - dp(3.2f), iconY - dp(6.2f), iconX + dp(3.2f),
+                iconY + dp(0.8f), 196f, 148f, false, paint);
+        paint.setStyle(Paint.Style.FILL);
+        canvas.drawRoundRect(iconX - dp(4.2f), iconY - dp(0.8f),
+                iconX + dp(4.2f), iconY + dp(5.2f), dp(1.2f), dp(1.2f), paint);
+        paint.setStrokeCap(Paint.Cap.BUTT);
+        drawText(canvas, playerViewLocked ? "LOCKED" : "LOCK", lock.left + dp(20),
+                lock.centerY() + dp(2.1f), dp(4.4f),
+                playerViewLocked ? 0xffffe2d7 : 0xffb4afa4,
+                labelFace, Paint.Align.LEFT, 0.75f);
+        addHit(ACTION_PLAYER_VIEW_LOCK, expand(lock, dp(3)), -1);
     }
 
     private void drawPlayerWindowReflection(Canvas canvas, RectF window) {
@@ -1799,6 +2007,21 @@ public final class WalkTapeView extends View {
         float toneY = body.top + body.height() * 0.30f;
         RectF switchTrack = new RectF(toneX - dp(6), toneY, toneX + dp(6), toneY + dp(33));
         addHit(ACTION_TONE, expand(switchTrack, dp(8)), -1);
+
+        if (profile.isSonyWmD6c()) {
+            RectF dolbyTrack = sonyWmD6cDolbyTrack(body);
+            float third = dolbyTrack.height() / 3f;
+            float hitLeft = dolbyTrack.left - dp(6);
+            float hitRight = dolbyTrack.right + dp(13);
+            addHit(ACTION_DOLBY, new RectF(hitLeft,
+                    dolbyTrack.top, hitRight, dolbyTrack.top + third), 2);
+            addHit(ACTION_DOLBY, new RectF(hitLeft,
+                    dolbyTrack.top + third, hitRight, dolbyTrack.top + third * 2f), 1);
+            addHit(ACTION_DOLBY, new RectF(hitLeft,
+                    dolbyTrack.top + third * 2f, hitRight, dolbyTrack.bottom), 0);
+        } else if (profile.isAiwaHsJx707()) {
+            addHit(ACTION_DOLBY, expand(aiwaDolbyBadge(body), dp(5)), -1);
+        }
     }
 
     private void drawRotationInterlude(Canvas canvas, int width, int height) {
@@ -1821,10 +2044,238 @@ public final class WalkTapeView extends View {
     }
 
     private void drawSelectedMachine(Canvas canvas, RectF body) {
-        if (profile.isAiwaHsJx707()) {
+        if (profile.isSonyWmD6c()) {
+            drawSonyWmD6c(canvas, body);
+        } else if (profile.isAiwaHsJx707()) {
             drawAiwaHsJx707(canvas, body);
+        } else if (profile.isSonyWmF2015()) {
+            drawSonyWmF2015(canvas, body);
         } else {
             drawTpsL2(canvas, body);
+        }
+    }
+
+    private void drawSonyWmD6c(Canvas canvas, RectF body) {
+        float radius = body.height() * 0.018f;
+        paint.setColor(0xb8000000);
+        canvas.drawRoundRect(body.left + dp(7), body.top + dp(9), body.right + dp(10),
+                body.bottom + dp(11), radius, radius, paint);
+
+        paint.setAlpha(255);
+        paint.setShader(new LinearGradient(body.left, body.top, body.right, body.bottom,
+                new int[]{0xff484a48, 0xff222423, 0xff111313, 0xff343634},
+                new float[]{0f, 0.24f, 0.70f, 1f}, Shader.TileMode.CLAMP));
+        canvas.drawRoundRect(body, radius, radius, paint);
+        paint.setShader(null);
+        drawBrushedMetal(canvas, body);
+
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(1.05f));
+        paint.setColor(0xff080909);
+        canvas.drawRoundRect(inset(body, dp(2)), radius, radius, paint);
+        paint.setStrokeWidth(dp(0.55f));
+        paint.setColor(0x708e918d);
+        canvas.drawRoundRect(body.left + dp(4), body.top + dp(4), body.right - dp(4),
+                body.bottom - dp(4), radius * 0.76f, radius * 0.76f, paint);
+        paint.setStyle(Paint.Style.FILL);
+
+        float seamY = body.top + body.height() * 0.145f;
+        paint.setColor(0x69050606);
+        canvas.drawRect(body.left + dp(2), seamY, body.right - dp(2),
+                seamY + dp(1.1f), paint);
+        drawText(canvas, "SONY", body.left + body.width() * 0.048f,
+                body.top + body.height() * 0.115f, dp(15f), 0xfff0f0eb,
+                labelFace, Paint.Align.LEFT, 0.18f);
+
+        float badgeLeft = body.left + body.width() * 0.30f;
+        String[] badges = {"QUARTZ LOCK", "DISC DRIVE", "DOLBY B·C NR"};
+        for (int index = 0; index < badges.length; index++) {
+            float badgeWidth = index == 2 ? dp(43) : dp(38);
+            RectF badge = new RectF(badgeLeft, body.top + dp(9),
+                    badgeLeft + badgeWidth, body.top + dp(23));
+            paint.setColor(0xff131514);
+            canvas.drawRoundRect(badge, dp(1.5f), dp(1.5f), paint);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(dp(0.45f));
+            paint.setColor(index == 2 ? 0x9ac7a744 : 0x628e918d);
+            canvas.drawRoundRect(badge, dp(1.5f), dp(1.5f), paint);
+            paint.setStyle(Paint.Style.FILL);
+            drawText(canvas, badges[index], badge.centerX(), badge.centerY() + dp(1.7f),
+                    dp(3.5f), index == 2 ? 0xffd6b34a : 0xffb8bbb6,
+                    condensedFace, Paint.Align.CENTER, 0.32f);
+            badgeLeft = badge.right + dp(4);
+        }
+
+        RectF window = sonyWmD6cWindow(body);
+        paint.setShader(new LinearGradient(window.left, window.top,
+                window.right, window.bottom,
+                new int[]{0xff171918, 0xff050606, 0xff202220}, null,
+                Shader.TileMode.CLAMP));
+        canvas.drawRoundRect(window, dp(3), dp(3), paint);
+        paint.setShader(null);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(2.0f));
+        paint.setColor(0xff070808);
+        canvas.drawRoundRect(window, dp(3), dp(3), paint);
+        paint.setStrokeWidth(dp(0.65f));
+        paint.setColor(0x6b969a94);
+        canvas.drawRoundRect(inset(window, dp(2.4f)), dp(2), dp(2), paint);
+        paint.setStyle(Paint.Style.FILL);
+        RectF visibleTape = inset(window, dp(5));
+        drawCassette(canvas, visibleTape, selectedAlbum, reelAngle, true);
+
+        // The red dot field and script are the unmistakable D6C window graphic. The opacity is
+        // held back so the listener's own album artwork remains legible beneath the glazing.
+        float dotStartX = window.left + window.width() * 0.045f;
+        float dotStartY = window.top + window.height() * 0.10f;
+        float dotStep = Math.max(dp(3.3f), window.height() * 0.055f);
+        paint.setColor(0xcff16647);
+        for (int row = 0; row < 6; row++) {
+            for (int column = 0; column < 7; column++) {
+                if (column + row > 8) {
+                    continue;
+                }
+                canvas.drawCircle(dotStartX + column * dotStep,
+                        dotStartY + row * dotStep, dp(1.35f), paint);
+            }
+        }
+        drawText(canvas, "It's a Sony", window.left + window.width() * 0.045f,
+                window.bottom - dp(8), dp(5.6f), 0xffef6749,
+                displayFace, Paint.Align.LEFT, 0.05f);
+        drawPlayerWindowReflection(canvas, window);
+
+        RectF rail = new RectF(body.left + body.width() * 0.785f,
+                body.top + body.height() * 0.175f,
+                body.right - body.width() * 0.035f,
+                body.top + body.height() * 0.775f);
+        paint.setColor(0x71101211);
+        canvas.drawRoundRect(rail, dp(2), dp(2), paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(0.55f));
+        paint.setColor(0x477f827e);
+        canvas.drawRoundRect(rail, dp(2), dp(2), paint);
+        paint.setStyle(Paint.Style.FILL);
+
+        float dolbyX = rail.left + rail.width() * 0.23f;
+        float dolbyTop = rail.top + rail.height() * 0.12f;
+        drawText(canvas, "DOLBY NR", dolbyX, dolbyTop - dp(5), dp(3.5f),
+                0xffdadbd5, labelFace, Paint.Align.CENTER, 0.35f);
+        RectF dolbyTrack = sonyWmD6cDolbyTrack(body);
+        paint.setColor(0xff050606);
+        canvas.drawRoundRect(dolbyTrack, dp(2), dp(2), paint);
+        float knobY = dolbyMode == DolbyMode.C
+                ? dolbyTrack.top + dp(4.6f)
+                : dolbyMode == DolbyMode.B ? dolbyTrack.centerY()
+                : dolbyTrack.bottom - dp(4.7f);
+        paint.setColor(ACTION_DOLBY.equals(pressedAction) ? 0xffd5aa3d : 0xff9a9d97);
+        canvas.drawRoundRect(dolbyTrack.left + dp(1.2f), knobY - dp(3),
+                dolbyTrack.right - dp(1.2f), knobY + dp(3),
+                dp(1), dp(1), paint);
+        drawText(canvas, "C", dolbyTrack.right + dp(2.5f), dolbyTrack.top + dp(4),
+                dp(3.1f), dolbyMode == DolbyMode.C ? 0xfff2c859 : 0xffa9aaa5,
+                condensedFace, Paint.Align.LEFT, 0.15f);
+        drawText(canvas, "B", dolbyTrack.right + dp(2.5f), dolbyTrack.centerY() + dp(1),
+                dp(3.1f), dolbyMode == DolbyMode.B ? 0xfff2c859 : 0xffa9aaa5,
+                condensedFace, Paint.Align.LEFT, 0.15f);
+        drawText(canvas, "OFF", dolbyTrack.right + dp(2.5f), dolbyTrack.bottom,
+                dp(2.8f), dolbyMode == DolbyMode.OFF ? 0xfff0f0ea : 0xffa9aaa5,
+                condensedFace, Paint.Align.LEFT, 0.15f);
+
+        drawSonyWmD6cMeterHousing(canvas, body);
+
+        float logoY = body.top + body.height() * 0.835f;
+        drawText(canvas, "WALKMAN", body.left + body.width() * 0.045f, logoY,
+                dp(15.5f), 0xfff0f0ea, condensedFace, Paint.Align.LEFT, -0.15f);
+        drawText(canvas, "PROFESSIONAL", body.left + body.width() * 0.205f, logoY - dp(1),
+                dp(6.1f), 0xffeeeee8, labelFace, Paint.Align.LEFT, 0.22f);
+        RectF dolbyBadge = new RectF(body.left + body.width() * 0.205f,
+                logoY + dp(3), body.left + body.width() * 0.315f, logoY + dp(14));
+        paint.setColor(0xffc9a329);
+        canvas.drawRoundRect(dolbyBadge, dp(1), dp(1), paint);
+        drawText(canvas, "DOLBY B·C NR", dolbyBadge.centerX(),
+                dolbyBadge.centerY() + dp(1.7f), dp(3.8f), 0xff151613,
+                condensedFace, Paint.Align.CENTER, 0.28f);
+        drawText(canvas, "STEREO CASSETTE-CORDER   WM-D6C", body.right - dp(10),
+                logoY + dp(7), dp(4.3f), 0xffd7d7d1,
+                labelFace, Paint.Align.RIGHT, 0.48f);
+
+        drawMechanicalControls(canvas, body);
+    }
+
+    private RectF sonyWmD6cWindow(RectF body) {
+        return new RectF(body.left + body.width() * 0.205f,
+                body.top + body.height() * 0.205f,
+                body.left + body.width() * 0.765f,
+                body.top + body.height() * 0.690f);
+    }
+
+    private RectF sonyWmD6cDolbyTrack(RectF body) {
+        float railLeft = body.left + body.width() * 0.785f;
+        float railRight = body.right - body.width() * 0.035f;
+        float railTop = body.top + body.height() * 0.175f;
+        float railBottom = body.top + body.height() * 0.775f;
+        float dolbyX = railLeft + (railRight - railLeft) * 0.23f;
+        float dolbyTop = railTop + (railBottom - railTop) * 0.12f;
+        return new RectF(dolbyX - dp(4.2f), dolbyTop,
+                dolbyX + dp(4.2f), dolbyTop + dp(29));
+    }
+
+    private void drawSonyWmD6cMeterHousing(Canvas canvas, RectF body) {
+        float left = body.left + body.width() * 0.824f;
+        float right = body.left + body.width() * 0.852f;
+        float top = body.top + body.height() * 0.485f;
+        float segmentHeight = body.height() * 0.036f;
+        float gap = body.height() * 0.013f;
+        String[] labels = {"+6", "+3", "0", "−5", "−10"};
+        for (int index = 0; index < labels.length; index++) {
+            float segmentTop = top + index * (segmentHeight + gap);
+            RectF segment = new RectF(left, segmentTop, right,
+                    segmentTop + segmentHeight);
+            paint.setColor(0xff090808);
+            canvas.drawRoundRect(segment, dp(1.2f), dp(1.2f), paint);
+            paint.setColor(index < 2 ? 0xff2d0b09 : 0xff240b0a);
+            canvas.drawRoundRect(inset(segment, dp(1.1f)), dp(0.7f), dp(0.7f), paint);
+            drawText(canvas, labels[index], segment.left - dp(3),
+                    segment.centerY() + dp(1.6f), dp(3.5f),
+                    index < 2 ? 0xffee6a4c : 0xffc6c7c1,
+                    condensedFace, Paint.Align.RIGHT, 0.15f);
+        }
+        float bottom = top + 5 * segmentHeight + 4 * gap;
+        drawText(canvas, "PEAK", (left + right) * 0.5f, bottom + dp(8), dp(3.4f),
+                0xffd0d0ca, condensedFace, Paint.Align.CENTER, 0.32f);
+        drawText(canvas, "L/R MAX", (left + right) * 0.5f, bottom + dp(14), dp(2.8f),
+                0xff8d8f8a, condensedFace, Paint.Align.CENTER, 0.18f);
+    }
+
+    private void drawSonyWmD6cMeterLights(Canvas canvas, RectF body) {
+        int activeSegments = d6cMeterSegmentCountForTest(audioMeterDisplay);
+        if (activeSegments <= 0) {
+            return;
+        }
+        float left = body.left + body.width() * 0.824f;
+        float right = body.left + body.width() * 0.852f;
+        float top = body.top + body.height() * 0.485f;
+        float segmentHeight = body.height() * 0.036f;
+        float gap = body.height() * 0.013f;
+        for (int index = 0; index < 5; index++) {
+            int levelFromBottom = 5 - index;
+            if (activeSegments < levelFromBottom) {
+                continue;
+            }
+            float segmentTop = top + index * (segmentHeight + gap);
+            RectF segment = new RectF(left, segmentTop, right,
+                    segmentTop + segmentHeight);
+            paint.setColor(index == 0 ? 0x50ff4b2d : 0x3ee95832);
+            canvas.drawRoundRect(segment.left - dp(2.1f), segment.top - dp(1.6f),
+                    segment.right + dp(2.1f), segment.bottom + dp(1.6f),
+                    dp(2.2f), dp(2.2f), paint);
+            paint.setShader(new LinearGradient(segment.left, segment.top,
+                    segment.right, segment.bottom,
+                    new int[]{index < 2 ? 0xffff6d43 : 0xfff95738,
+                            index < 2 ? 0xffff3d25 : 0xffd82d22},
+                    null, Shader.TileMode.CLAMP));
+            canvas.drawRoundRect(inset(segment, dp(0.8f)), dp(0.8f), dp(0.8f), paint);
+            paint.setShader(null);
         }
     }
 
@@ -1933,6 +2384,181 @@ public final class WalkTapeView extends View {
         drawHeadphoneJacks(canvas, body);
     }
 
+    private void drawSonyWmF2015(Canvas canvas, RectF body) {
+        float radius = body.height() * 0.030f;
+        paint.setColor(0xa9000000);
+        canvas.drawRoundRect(body.left + dp(6), body.top + dp(9), body.right + dp(10),
+                body.bottom + dp(11), radius, radius, paint);
+
+        paint.setAlpha(255);
+        paint.setShader(new LinearGradient(body.left, body.top, body.right, body.bottom,
+                new int[]{0xff343738, 0xff111313, 0xff070808, 0xff272a2a},
+                new float[]{0f, 0.28f, 0.72f, 1f}, Shader.TileMode.CLAMP));
+        canvas.drawRoundRect(body, radius, radius, paint);
+        paint.setShader(null);
+
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(1.1f));
+        paint.setColor(0xff020303);
+        canvas.drawRoundRect(inset(body, dp(2)), radius, radius, paint);
+        paint.setStrokeWidth(dp(0.7f));
+        paint.setColor(0x667f8585);
+        canvas.drawRoundRect(body.left + dp(4), body.top + dp(4), body.right - dp(4),
+                body.bottom - dp(4), radius * 0.84f, radius * 0.84f, paint);
+        paint.setStyle(Paint.Style.FILL);
+
+        float faceLeft = body.left + body.width() * 0.075f;
+        float faceTop = body.top + body.height() * 0.075f;
+        float faceRight = body.right - body.width() * 0.108f;
+        float faceBottom = body.bottom - body.height() * 0.12f;
+
+        RectF tuner = new RectF(faceLeft, body.top + dp(7), faceRight,
+                Math.max(body.top + dp(25), faceTop - dp(5)));
+        paint.setColor(0xff090b0b);
+        canvas.drawRoundRect(tuner, dp(2), dp(2), paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(0.55f));
+        paint.setColor(0x708e9493);
+        canvas.drawRoundRect(tuner, dp(2), dp(2), paint);
+        paint.setStyle(Paint.Style.FILL);
+        float scaleLeft = tuner.left + dp(34);
+        float scaleRight = tuner.right - dp(35);
+        float fmY = tuner.top + tuner.height() * 0.35f;
+        float amY = tuner.top + tuner.height() * 0.73f;
+        drawText(canvas, "FM", tuner.left + dp(7), fmY + dp(1.5f), dp(4.0f),
+                0xffe2e3df, condensedFace, Paint.Align.LEFT, 0.55f);
+        drawText(canvas, "AM", tuner.left + dp(7), amY + dp(1.5f), dp(4.0f),
+                0xffc4c7c3, condensedFace, Paint.Align.LEFT, 0.55f);
+        paint.setColor(0xffd6d8d4);
+        canvas.drawRect(scaleLeft, fmY, scaleRight, fmY + dp(0.7f), paint);
+        paint.setColor(0xff929795);
+        canvas.drawRect(scaleLeft, amY, scaleRight, amY + dp(0.6f), paint);
+        for (int tick = 0; tick <= 10; tick++) {
+            float x = lerp(scaleLeft, scaleRight, tick / 10f);
+            paint.setColor(tick % 2 == 0 ? 0xffe1e2de : 0xff777d7b);
+            canvas.drawCircle(x, fmY, tick % 2 == 0 ? dp(1.05f) : dp(0.65f), paint);
+            canvas.drawCircle(x, amY, tick % 2 == 0 ? dp(0.85f) : dp(0.55f), paint);
+        }
+        drawText(canvas, "88  92  96  100  107", (scaleLeft + scaleRight) * 0.5f,
+                fmY + dp(2), dp(3.6f), 0xffe7e8e4, condensedFace,
+                Paint.Align.CENTER, 0.35f);
+        drawText(canvas, "5.4  6  7  8  10  12  16", (scaleLeft + scaleRight) * 0.5f,
+                amY + dp(2), dp(3.25f), 0xffbfc2bf, condensedFace,
+                Paint.Align.CENTER, 0.28f);
+        drawText(canvas, "MHz", tuner.right - dp(6), fmY + dp(1.5f), dp(3.4f),
+                0xffd7d9d5, condensedFace, Paint.Align.RIGHT, 0.3f);
+        drawText(canvas, "x100 kHz", tuner.right - dp(6), amY + dp(1.5f), dp(3.0f),
+                0xffaeb2af, condensedFace, Paint.Align.RIGHT, 0.2f);
+
+        RectF face = new RectF(faceLeft, faceTop, faceRight, faceBottom);
+        paint.setShader(new LinearGradient(face.left, face.top, face.right, face.bottom,
+                new int[]{0xff2b2e2f, 0xff090b0b, 0xff202323, 0xff080909},
+                new float[]{0f, 0.34f, 0.70f, 1f}, Shader.TileMode.CLAMP));
+        canvas.drawRoundRect(face, radius * 0.42f, radius * 0.42f, paint);
+        paint.setShader(null);
+
+        float railWidth = face.width() * 0.16f;
+        RectF brandRail = new RectF(face.left + dp(5), face.top + dp(7),
+                face.left + railWidth, face.bottom - dp(7));
+        paint.setShader(new LinearGradient(brandRail.left, brandRail.top,
+                brandRail.right, brandRail.bottom,
+                new int[]{0xff343738, 0xff141616, 0xff2a2d2d}, null,
+                Shader.TileMode.CLAMP));
+        canvas.drawRoundRect(brandRail, dp(2), dp(2), paint);
+        paint.setShader(null);
+        drawVerticalLabel(canvas, "SONY", brandRail.centerX() - dp(1),
+                brandRail.bottom - dp(9), dp(10.0f), 0xffe2e2dc);
+        drawVerticalLabel(canvas, "STEREO", brandRail.centerX() + dp(9),
+                brandRail.bottom - dp(9), dp(4.2f), 0xff9da19f);
+
+        RectF door = new RectF(face.left + railWidth + dp(8), face.top + dp(8),
+                face.right - dp(9), face.bottom - dp(9));
+        paint.setShader(new LinearGradient(door.left, door.top, door.right, door.bottom,
+                new int[]{0xff35393a, 0xff111414, 0xff272a2a}, null,
+                Shader.TileMode.CLAMP));
+        canvas.drawRoundRect(door, dp(3), dp(3), paint);
+        paint.setShader(null);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(1.1f));
+        paint.setColor(0xff050606);
+        canvas.drawRoundRect(door, dp(3), dp(3), paint);
+        paint.setColor(0x628b9190);
+        canvas.drawRoundRect(inset(door, dp(2)), dp(2), dp(2), paint);
+        paint.setStyle(Paint.Style.FILL);
+
+        float windowMarginX = door.width() * 0.105f;
+        float windowMarginY = door.height() * 0.10f;
+        RectF window = new RectF(door.left + windowMarginX, door.top + windowMarginY,
+                door.right - windowMarginX, door.bottom - windowMarginY);
+        paint.setColor(0xff050707);
+        canvas.drawRoundRect(window, dp(3), dp(3), paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(dp(2f));
+        paint.setColor(0xff676b69);
+        canvas.drawRoundRect(window, dp(3), dp(3), paint);
+        paint.setStyle(Paint.Style.FILL);
+
+        RectF visibleTape = inset(window, dp(5));
+        drawCassette(canvas, visibleTape, selectedAlbum, reelAngle, true);
+        paint.setColor(0x22e0e5e3);
+        path.reset();
+        path.moveTo(window.left + dp(5), window.top + dp(3));
+        path.lineTo(window.right - dp(19), window.top + dp(3));
+        path.lineTo(window.right - dp(44), window.bottom - dp(3));
+        path.lineTo(window.left + dp(21), window.bottom - dp(3));
+        path.close();
+        canvas.drawPath(path, paint);
+
+        RectF walkmanBadge = new RectF(window.right + dp(3), window.top + dp(2),
+                door.right - dp(3), window.bottom - dp(2));
+        paint.setShader(new LinearGradient(walkmanBadge.left, walkmanBadge.top,
+                walkmanBadge.right, walkmanBadge.bottom,
+                new int[]{0xffd5d5cf, 0xff707473, 0xffc7c8c3}, null,
+                Shader.TileMode.CLAMP));
+        canvas.drawRoundRect(walkmanBadge, dp(1.4f), dp(1.4f), paint);
+        paint.setShader(null);
+        drawVerticalLabel(canvas, "WALKMAN", walkmanBadge.centerX() - dp(0.5f),
+                walkmanBadge.bottom - dp(7), dp(7.4f), 0xff222424);
+
+        drawText(canvas, "WM-F2015", face.right - dp(9), face.top + dp(6), dp(5.5f),
+                0xffc8cbc8, condensedFace, Paint.Align.RIGHT, 0.75f);
+        drawText(canvas, "FM / AM RADIO CASSETTE PLAYER", face.right - dp(9),
+                face.bottom - dp(3), dp(4.25f), 0xff929795, labelFace,
+                Paint.Align.RIGHT, 0.58f);
+
+        float badgeTop = body.top + dp(12);
+        float badgeLeft = body.left + dp(8);
+        String[] badges = {"FM / AM", "MANUAL TAPE", "LA4570M"};
+        for (String badgeText : badges) {
+            float badgeWidth = badgeText.length() > 7 ? dp(39) : dp(29);
+            RectF badge = new RectF(badgeLeft, badgeTop,
+                    badgeLeft + badgeWidth, badgeTop + dp(14));
+            paint.setColor(0xff090a0a);
+            canvas.drawRoundRect(badge, dp(1.5f), dp(1.5f), paint);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(dp(0.45f));
+            paint.setColor(0x6faeb3b1);
+            canvas.drawRoundRect(badge, dp(1.5f), dp(1.5f), paint);
+            paint.setStyle(Paint.Style.FILL);
+            drawText(canvas, badgeText, badge.centerX(), badge.centerY() + dp(1.8f),
+                    dp(3.45f), 0xffc8cbc8, condensedFace, Paint.Align.CENTER, 0.28f);
+            badgeLeft = badge.right + dp(3);
+        }
+
+        drawMechanicalControls(canvas, body);
+        float phoneX = body.right - body.width() * 0.052f;
+        float phoneY = body.top + body.height() * 0.17f;
+        float phoneRadius = Math.max(dp(6.5f), body.height() * 0.027f);
+        paint.setColor(0xff020303);
+        canvas.drawCircle(phoneX, phoneY, phoneRadius + dp(2), paint);
+        paint.setColor(0xff5d6261);
+        canvas.drawCircle(phoneX, phoneY, phoneRadius, paint);
+        paint.setColor(0xff030404);
+        canvas.drawCircle(phoneX, phoneY, phoneRadius * 0.56f, paint);
+        drawText(canvas, "PHONES", phoneX - phoneRadius - dp(3), phoneY + dp(2), dp(3.6f),
+                0xffc4c8c5, labelFace, Paint.Align.RIGHT, 0.35f);
+    }
+
     private void drawAiwaHsJx707(Canvas canvas, RectF body) {
         float radius = body.height() * 0.027f;
         paint.setColor(0xa6000000);
@@ -2029,20 +2655,22 @@ public final class WalkTapeView extends View {
 
         float badgeTop = body.top + dp(12);
         float badgeLeft = body.left + dp(8);
-        String[] badges = {"BBE", "DSL", "DOLBY B-C"};
+        String[] badges = {"BBE", "DSL", "DOLBY " + dolbyMode.label};
         for (int index = 0; index < badges.length; index++) {
-            float badgeWidth = index == 2 ? dp(34) : dp(23);
+            float badgeWidth = index == 2 ? dp(42) : dp(23);
             RectF badge = new RectF(badgeLeft, badgeTop,
                     badgeLeft + badgeWidth, badgeTop + dp(14));
-            paint.setColor(0xff111311);
+            boolean dolbySelected = index == 2 && dolbyMode != DolbyMode.OFF;
+            paint.setColor(dolbySelected ? 0xff292315 : 0xff111311);
             canvas.drawRoundRect(badge, dp(1.5f), dp(1.5f), paint);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(dp(0.45f));
-            paint.setColor(0x72c6b687);
+            paint.setColor(dolbySelected ? 0xffd7b444 : 0x72c6b687);
             canvas.drawRoundRect(badge, dp(1.5f), dp(1.5f), paint);
             paint.setStyle(Paint.Style.FILL);
             drawText(canvas, badges[index], badge.centerX(), badge.centerY() + dp(1.8f),
-                    dp(3.6f), 0xffbcae88, condensedFace, Paint.Align.CENTER, 0.35f);
+                    dp(3.6f), dolbySelected ? 0xffffd968 : 0xffbcae88,
+                    condensedFace, Paint.Align.CENTER, 0.35f);
             badgeLeft = badge.right + dp(3);
         }
 
@@ -2050,8 +2678,17 @@ public final class WalkTapeView extends View {
         drawHeadphoneJacks(canvas, body);
     }
 
+    private RectF aiwaDolbyBadge(RectF body) {
+        return new RectF(body.left + dp(60), body.top + dp(12),
+                body.left + dp(102), body.top + dp(26));
+    }
+
     private void drawMechanicalControls(Canvas canvas, RectF body) {
         boolean aiwa = profile.isAiwaHsJx707();
+        boolean f2015 = profile.isSonyWmF2015();
+        boolean d6c = profile.isSonyWmD6c();
+        boolean darkMachine = aiwa || f2015 || d6c;
+        boolean tapeSelector = profile.usesTapeTypeSelector();
         float controlTop = body.bottom - body.height() * 0.116f;
         float left = body.left + body.width() * 0.24f;
         float totalWidth = body.width() * 0.48f;
@@ -2065,12 +2702,12 @@ public final class WalkTapeView extends View {
             RectF button = new RectF(x, controlTop, x + buttonWidth, controlTop + buttonHeight);
             boolean pressed = actions[i].equals(pressedAction) || (i == 2 && playing);
             float offset = pressed ? dp(2.1f) * Math.max(0.7f, buttonPress) : 0;
-            paint.setColor(aiwa ? 0xff050606 : 0xff0d2028);
+            paint.setColor(darkMachine ? 0xff050606 : 0xff0d2028);
             canvas.drawRoundRect(button.left, button.top + dp(3), button.right,
                     button.bottom + dp(4), dp(2), dp(2), paint);
             paint.setAlpha(255);
             paint.setShader(new LinearGradient(0, button.top, 0, button.bottom,
-                    aiwa
+                    darkMachine
                             ? new int[]{pressed ? 0xff333431 : 0xff555651, 0xff171918}
                             : new int[]{pressed ? 0xff7f817d : 0xffafb0aa, 0xff6d6f6b},
                     null, Shader.TileMode.CLAMP));
@@ -2078,29 +2715,32 @@ public final class WalkTapeView extends View {
                     button.bottom + offset, dp(2), dp(2), paint);
             paint.setShader(null);
             drawText(canvas, symbols[i], button.centerX(), button.centerY() + dp(4) + offset,
-                    i == 0 ? dp(7) : dp(6.2f), aiwa ? 0xffd0c49f : 0xff252827,
+                    i == 0 ? dp(7) : dp(6.2f), aiwa ? 0xffd0c49f
+                            : (f2015 || d6c) ? 0xffe1e1dc : 0xff252827,
                     condensedFace,
                     Paint.Align.CENTER, 0.2f);
         }
 
         float toneX = body.right - body.width() * 0.083f;
         float toneY = body.top + body.height() * 0.30f;
-        drawText(canvas, aiwa ? "TAPE" : "TONE", toneX, toneY - dp(8), dp(4.8f),
-                aiwa ? 0xffcbbd94 : 0xffd7dfdf,
+        drawText(canvas, tapeSelector ? "TAPE" : "TONE", toneX, toneY - dp(8), dp(4.8f),
+                aiwa ? 0xffcbbd94 : d6c ? 0xffd8d8d1 : 0xffd7dfdf,
                 labelFace, Paint.Align.CENTER, 0.7f);
         RectF switchTrack = new RectF(toneX - dp(6), toneY, toneX + dp(6), toneY + dp(33));
-        paint.setColor(aiwa ? 0xff070808 : 0xff0c252f);
+        paint.setColor(darkMachine ? 0xff070808 : 0xff0c252f);
         canvas.drawRoundRect(switchTrack, dp(4), dp(4), paint);
         float knobY = highTape ? switchTrack.top + dp(4) : switchTrack.bottom - dp(12);
-        paint.setColor(aiwa ? 0xffb9aa82 : 0xffc6c5bb);
+        paint.setColor(aiwa ? 0xffb9aa82 : d6c ? 0xff9ea19c : 0xffc6c5bb);
         canvas.drawRoundRect(switchTrack.left + dp(2), knobY, switchTrack.right - dp(2),
                 knobY + dp(8), dp(2), dp(2), paint);
         drawText(canvas, profile.highTapeLabel, switchTrack.right + dp(3),
-                switchTrack.top + dp(7), aiwa ? dp(3.0f) : dp(3.7f),
-                aiwa ? 0xffb6aa8b : 0xffadc1c6, labelFace, Paint.Align.LEFT, 0.25f);
+                switchTrack.top + dp(7), tapeSelector ? dp(3.0f) : dp(3.7f),
+                aiwa ? 0xffb6aa8b : (f2015 || d6c) ? 0xffc9cac5 : 0xffadc1c6,
+                labelFace, Paint.Align.LEFT, 0.25f);
         drawText(canvas, profile.lowTapeLabel, switchTrack.right + dp(3),
-                switchTrack.bottom - dp(1), aiwa ? dp(3.1f) : dp(3.7f),
-                aiwa ? 0xffb6aa8b : 0xffadc1c6, labelFace, Paint.Align.LEFT, 0.25f);
+                switchTrack.bottom - dp(1), tapeSelector ? dp(3.1f) : dp(3.7f),
+                aiwa ? 0xffb6aa8b : (f2015 || d6c) ? 0xffc9cac5 : 0xffadc1c6,
+                labelFace, Paint.Align.LEFT, 0.25f);
     }
 
     private void drawHeadphoneJacks(Canvas canvas, RectF body) {
@@ -2227,21 +2867,28 @@ public final class WalkTapeView extends View {
         y += dp(18);
         drawSpecRow(canvas, left, right, y, "WOW / FLUTTER", profile.wowFlutterSpec);
         y += dp(18);
-        drawSpecRow(canvas, left, right, y, profile.noiseSpecLabel, profile.noiseSpecValue);
+        drawSpecRow(canvas, left, right, y, profile.noiseSpecLabel,
+                profile.noiseSpecValue(dolbyMode, tapeProfile));
         y += dp(18);
         drawSpecRow(canvas, left, right, y, "TAPE / EQ",
                 tapeProfile.manufacturer + " " + tapeProfile.model + "  ·  "
                         + tapeProfile.replayEqMicroseconds + " µs");
+        y += dp(15);
+        // Keep every calibration value on one shared right edge. The track-list control lives
+        // below this row, so reserving its width here made UNIT CONDITION visibly misaligned.
+        drawSpecRow(canvas, left, right, y, "UNIT CONDITION", conditionProfile.name);
 
         float footer = info.bottom - dp(20);
         drawText(canvas, hotline ? "HOT LINE ACTIVE  ·  LIVE MIC" :
                         "DSP: " + profile.model + " × " + tapeProfile.model + "  ·  "
-                                + (highTape ? profile.highTapeLabel : profile.lowTapeLabel),
+                                + (highTape ? profile.highTapeLabel : profile.lowTapeLabel)
+                                + (profile.supportsDolbyBC()
+                                ? "  ·  DOLBY " + dolbyMode.label : ""),
                 left, footer, dp(5.25f), hotline ? ORANGE : 0xff716d64,
                 condensedFace, Paint.Align.LEFT, 0.72f);
 
-        RectF flipButton = new RectF(info.right - dp(86), info.bottom - dp(43),
-                info.right - dp(11), info.bottom - dp(11));
+        RectF flipButton = new RectF(info.right - dp(86), info.bottom - dp(34),
+                info.right - dp(11), info.bottom - dp(10));
         boolean pressed = ACTION_INFO_FLIP.equals(pressedAction);
         paint.setColor(pressed ? 0x35e95c2c : 0x17000000);
         canvas.drawRoundRect(flipButton, dp(3), dp(3), paint);
@@ -2831,16 +3478,35 @@ public final class WalkTapeView extends View {
 
     private void handleAction(HitTarget target) {
         switch (target.action) {
+            case ACTION_PLAYER_INFO_TOGGLE:
+                if (playerViewLocked) {
+                    announceForAccessibility("播放视图已锁定");
+                } else {
+                    playerInfoTarget = playerInfoTarget < 0.5f ? 1f : 0f;
+                    recyclePlayerStaticFrame();
+                    announceForAccessibility(playerInfoTarget < 0.5f
+                            ? "全屏磁带机，播放信息已隐藏" : "显示播放信息");
+                }
+                break;
+            case ACTION_PLAYER_VIEW_LOCK:
+                playerViewLocked = !playerViewLocked;
+                announceForAccessibility(playerViewLocked
+                        ? "已锁定播放视图，磁带机区域触摸不会切换信息面板"
+                        : "已解除播放视图锁定");
+                invalidate();
+                break;
             case ACTION_SETTINGS:
                 settingsTarget = 1f;
-                announceForAccessibility("选择磁带机与磁带配方");
+                announceForAccessibility("选择磁带机、磁带配方与机器不完美感");
                 break;
             case ACTION_SETTINGS_CLOSE:
                 settingsTarget = 0f;
                 break;
             case ACTION_SETTINGS_SECTION:
-                settingsSection = target.index == 1 ? 1 : 0;
-                announceForAccessibility(settingsSection == 0 ? "磁带机列表" : "磁带配方列表");
+                settingsSection = Math.max(0, Math.min(2, target.index));
+                announceForAccessibility(settingsSection == 0
+                        ? "磁带机列表" : settingsSection == 1
+                        ? "磁带配方列表" : "机器不完美感列表");
                 invalidate();
                 break;
             case ACTION_MACHINE_PROFILE:
@@ -2855,7 +3521,7 @@ public final class WalkTapeView extends View {
                             listener.onHotlineChanged(false);
                         }
                         listener.onMachineProfileChanged(selectedProfile);
-                        if (selectedProfile.isAiwaHsJx707()) {
+                        if (selectedProfile.usesTapeTypeSelector()) {
                             boolean correctPosition = tapeProfile.isHighPosition();
                             setHighTape(correctPosition);
                             listener.onToneChanged(correctPosition);
@@ -2874,7 +3540,7 @@ public final class WalkTapeView extends View {
                     settingsTarget = 0f;
                     if (changed && listener != null) {
                         listener.onTapeProfileChanged(selectedTape);
-                        if (profile.isAiwaHsJx707()) {
+                        if (profile.usesTapeTypeSelector()) {
                             boolean correctPosition = selectedTape.isHighPosition();
                             setHighTape(correctPosition);
                             listener.onToneChanged(correctPosition);
@@ -2882,6 +3548,22 @@ public final class WalkTapeView extends View {
                     }
                     announceForAccessibility("已装入 " + selectedTape.manufacturer
                             + " " + selectedTape.model + " " + selectedTape.typeShortLabel());
+                }
+                break;
+            case ACTION_CONDITION_PROFILE:
+                List<MachineConditionProfile> conditionProfiles =
+                        MachineConditionProfile.availableProfiles();
+                if (target.index >= 0 && target.index < conditionProfiles.size()) {
+                    MachineConditionProfile selectedCondition =
+                            conditionProfiles.get(target.index);
+                    boolean changed = !selectedCondition.id.equals(conditionProfile.id);
+                    setConditionProfile(selectedCondition);
+                    settingsTarget = 0f;
+                    if (changed && listener != null) {
+                        listener.onConditionProfileChanged(selectedCondition);
+                    }
+                    announceForAccessibility("机器状态已切换为 " + selectedCondition.name
+                            + "，只模拟健康个体公差");
                 }
                 break;
             case ACTION_IMPORT:
@@ -3022,6 +3704,17 @@ public final class WalkTapeView extends View {
                     listener.onToneChanged(highTape);
                 }
                 announceForAccessibility(highTape ? profile.highTapeLabel : profile.lowTapeLabel);
+                break;
+            case ACTION_DOLBY:
+                if (profile.supportsDolbyBC()) {
+                    DolbyMode selected = target.index >= 0
+                            ? DolbyMode.forSelectorIndex(target.index) : dolbyMode.next();
+                    setDolbyMode(selected);
+                    if (listener != null) {
+                        listener.onDolbyModeChanged(selected);
+                    }
+                    announceForAccessibility("Dolby " + selected.label);
+                }
                 break;
             default:
                 break;
@@ -3302,7 +3995,7 @@ public final class WalkTapeView extends View {
         drawText(canvas, "SIGNAL CHAIN", contentLeft, y, dp(8.2f), INK,
                 labelFace, Paint.Align.LEFT, 1.55f);
         y += dp(13);
-        drawText(canvas, "MACHINE  ×  MAGNETIC STOCK", contentLeft, y,
+        drawText(canvas, "MACHINE  ×  MAGNETIC STOCK  ×  UNIT", contentLeft, y,
                 dp(4.9f), MUTED_INK, labelFace, Paint.Align.LEFT, 1.05f);
 
         RectF close = new RectF(panel.right - dp(45), panel.top + dp(9),
@@ -3312,29 +4005,51 @@ public final class WalkTapeView extends View {
 
         y += dp(14);
         float tabGap = dp(4);
-        float tabWidth = (contentRight - contentLeft - tabGap) * 0.5f;
+        float tabWidth = (contentRight - contentLeft - tabGap * 2f) / 3f;
         RectF machineTab = new RectF(contentLeft, y, contentLeft + tabWidth, y + dp(22));
-        RectF tapeTab = new RectF(machineTab.right + tabGap, y, contentRight, y + dp(22));
+        RectF tapeTab = new RectF(machineTab.right + tabGap, y,
+                machineTab.right + tabGap + tabWidth, y + dp(22));
+        RectF conditionTab = new RectF(tapeTab.right + tabGap, y,
+                contentRight, y + dp(22));
         drawSettingsTab(canvas, machineTab, "MACHINE", settingsSection == 0);
         drawSettingsTab(canvas, tapeTab, "TAPE STOCK", settingsSection == 1);
+        drawSettingsTab(canvas, conditionTab, "CONDITION", settingsSection == 2);
         addHit(ACTION_SETTINGS_SECTION, machineTab, 0);
         addHit(ACTION_SETTINGS_SECTION, tapeTab, 1);
+        addHit(ACTION_SETTINGS_SECTION, conditionTab, 2);
         y = machineTab.bottom + dp(8);
 
         if (settingsSection == 0) {
             drawMachineProfileCards(canvas, contentLeft, contentRight, y,
                     panel.bottom - dp(31));
-        } else {
+        } else if (settingsSection == 1) {
             drawTapeProfileCards(canvas, contentLeft, contentRight, y,
+                    panel.bottom - dp(31));
+        } else {
+            drawConditionProfileCards(canvas, contentLeft, contentRight, y,
                     panel.bottom - dp(31));
         }
 
-        drawText(canvas, settingsSection == 0
-                        ? "MACHINE PATH · DOLBY / DSL / BBE OFF"
-                        : "TAPE PATH · EQ / MOL / SOL / PARTICLE NOISE",
+        String settingsFooter;
+        if (settingsSection == 0) {
+            settingsFooter = profile.isSonyWmF2015()
+                    ? "MACHINE PATH · RADIO BYPASSED / NO DOLBY"
+                    : profile.isSonyWmD6c()
+                    ? "MACHINE PATH · QUARTZ SERVO / DOLBY " + dolbyMode.label
+                    : profile.isAiwaHsJx707()
+                    ? "MACHINE PATH · DOLBY " + dolbyMode.label + " / DSL + BBE OFF"
+                    : "MACHINE PATH · TONE / OUTPUT STAGE";
+        } else if (settingsSection == 1) {
+            settingsFooter = "TAPE PATH · EQ / MOL / SOL / PARTICLE NOISE";
+        } else {
+            settingsFooter = "TOLERANCE ONLY · NO DROPOUT / CRACKLE / DAMAGE";
+        }
+        drawText(canvas, settingsFooter,
                 contentLeft, panel.bottom - dp(23), dp(4.05f), 0xff8a8273,
                 labelFace, Paint.Align.LEFT, 0.78f);
-        drawText(canvas, "LIVE SWITCH · REBUILDS FROM THE CURRENT PLAYHEAD",
+        drawText(canvas, settingsSection == 2
+                        ? "HEALTHY UNITS · CONTINUOUS, BOUNDED VARIATION"
+                        : "LIVE SWITCH · REBUILDS FROM THE CURRENT PLAYHEAD",
                 contentLeft, panel.bottom - dp(12), dp(4.1f), 0xff6f6b62,
                 labelFace, Paint.Align.LEFT, 0.82f);
     }
@@ -3357,37 +4072,42 @@ public final class WalkTapeView extends View {
                                          float top,
                                          float bottom) {
         List<TapeMachineProfile> profiles = TapeMachineProfile.availableProfiles();
-        float gap = dp(8);
-        float cardHeight = (bottom - top - gap) / profiles.size();
+        float gap = dp(profiles.size() > 3 ? 2f : 8f);
+        float cardHeight = (bottom - top - gap * (profiles.size() - 1)) / profiles.size();
         cardHeight = Math.min(dp(88), cardHeight);
         float y = top;
         for (int index = 0; index < profiles.size(); index++) {
             TapeMachineProfile candidate = profiles.get(index);
             boolean selected = candidate.id.equals(profile.id);
-            int accent = candidate.isAiwaHsJx707() ? 0xffc7b47f : ORANGE;
+            int accent = candidate.isAiwaHsJx707() ? 0xffc7b47f
+                    : candidate.isSonyWmD6c() ? 0xffd5ae43
+                    : candidate.isSonyWmF2015() ? 0xffc8ccca : ORANGE;
             RectF card = new RectF(contentLeft, y,
                     contentRight, y + cardHeight);
             drawSettingsCardFrame(canvas, card, selected, accent);
 
+            boolean compact = cardHeight < dp(59);
             float cardLeft = card.left + dp(12);
             float cardRight = card.right - dp(12);
-            float cardY = card.top + dp(15);
+            float cardY = card.top + dp(compact ? 8.5f : 15f);
             drawText(canvas, candidate.manufacturer + "  /  " + candidate.year,
-                    cardLeft, cardY, dp(4.8f), selected ? accent : MUTED_INK,
+                    cardLeft, cardY, dp(compact ? 4.0f : 4.8f),
+                    selected ? accent : MUTED_INK,
                     labelFace, Paint.Align.LEFT, 1.05f);
-            cardY += dp(16);
-            drawText(canvas, candidate.model, cardLeft, cardY, dp(12.2f), INK,
+            cardY += dp(compact ? 11f : 16f);
+            drawText(canvas, candidate.model, cardLeft, cardY,
+                    dp(compact ? 8.5f : 12.2f), INK,
                     displayFace, Paint.Align.LEFT, 0.45f);
-            cardY += dp(13);
+            cardY += dp(compact ? 10f : 13f);
             drawEllipsizedText(canvas, candidate.calibrationBasis, cardLeft, cardY,
-                    cardRight - cardLeft - dp(2), dp(4.5f), 0xffa49c8c,
+                    cardRight - cardLeft - dp(2), dp(compact ? 3.6f : 4.5f), 0xffa49c8c,
                     labelFace, Paint.Align.LEFT);
-            cardY += dp(13);
+            cardY += dp(compact ? 9.5f : 13f);
             String spec = candidate.frequencySpec(true) + "   ·   "
                     + (candidate.isAiwaHsJx707()
                     ? "<0.45% RMS SERVICE LIMIT" : candidate.wowFlutterSpec);
             drawEllipsizedText(canvas, spec, cardLeft, cardY,
-                    cardRight - cardLeft - dp(2), dp(4.35f), 0xff716d64,
+                    cardRight - cardLeft - dp(2), dp(compact ? 3.45f : 4.35f), 0xff716d64,
                     condensedFace, Paint.Align.LEFT);
 
             if (selected) {
@@ -3445,6 +4165,45 @@ public final class WalkTapeView extends View {
                     cardRight - cardLeft, dp(4.0f), 0xff706c64,
                     condensedFace, Paint.Align.LEFT);
             addHit(ACTION_TAPE_PROFILE, card, index);
+            y = card.bottom + gap;
+        }
+    }
+
+    private void drawConditionProfileCards(Canvas canvas,
+                                           float contentLeft,
+                                           float contentRight,
+                                           float top,
+                                           float bottom) {
+        List<MachineConditionProfile> profiles =
+                MachineConditionProfile.availableProfiles();
+        float gap = dp(6);
+        float cardHeight = (bottom - top - gap * (profiles.size() - 1)) / profiles.size();
+        float y = top;
+        for (int index = 0; index < profiles.size(); index++) {
+            MachineConditionProfile candidate = profiles.get(index);
+            boolean selected = candidate.id.equals(conditionProfile.id);
+            int accent = candidate.accentColor;
+            RectF card = new RectF(contentLeft, y, contentRight, y + cardHeight);
+            drawSettingsCardFrame(canvas, card, selected, accent);
+
+            float cardLeft = card.left + dp(12);
+            float cardRight = card.right - dp(12);
+            drawText(canvas, candidate.levelLabel, cardLeft, card.top + dp(12),
+                    dp(4.5f), selected ? accent : MUTED_INK,
+                    labelFace, Paint.Align.LEFT, 1.0f);
+            drawText(canvas, candidate.isCalibrated() ? "0" : "CHARACTER",
+                    cardRight, card.top + dp(12), dp(4.4f),
+                    selected ? accent : 0xff78736a,
+                    labelFace, Paint.Align.RIGHT, 0.95f);
+            drawText(canvas, candidate.name, cardLeft, card.top + dp(28),
+                    dp(11.2f), INK, displayFace, Paint.Align.LEFT, 0.42f);
+            drawEllipsizedText(canvas, candidate.character, cardLeft, card.top + dp(41),
+                    cardRight - cardLeft, dp(4.25f), 0xffa49c8c,
+                    labelFace, Paint.Align.LEFT);
+            drawEllipsizedText(canvas, candidate.compactSpec, cardLeft, card.top + dp(53),
+                    cardRight - cardLeft, dp(4.0f), 0xff706c64,
+                    condensedFace, Paint.Align.LEFT);
+            addHit(ACTION_CONDITION_PROFILE, card, index);
             y = card.bottom + gap;
         }
     }

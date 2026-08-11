@@ -36,18 +36,34 @@ public class MainActivity extends AppCompatActivity implements
     private static final String PREFERENCES = "walktape_preferences";
     private static final String KEY_MACHINE_PROFILE = "machine_profile";
     private static final String KEY_TAPE_PROFILE = "tape_profile";
+    private static final String KEY_MACHINE_CONDITION = "machine_condition";
+    private static final String KEY_DOLBY_MODE = "dolby_mode";
     private final Handler progressHandler = new Handler(Looper.getMainLooper());
+    private final float[] playbackMeterLevels = new float[2];
     private final Runnable progressTicker = new Runnable() {
         @Override
         public void run() {
+            long nextTickMs = 180L;
             if (playbackController != null && walkTapeView != null) {
                 long duration = playbackController.getDurationMs();
                 if (duration > 0) {
                     walkTapeView.setPlaybackPosition(playbackController.getPositionMs(), duration);
                     walkTapeView.setPlaying(playbackController.isPlaying());
                 }
+                boolean liveD6cMeter = walkTapeView.isPlayerScene()
+                        && walkTapeView.getMachineProfile().isSonyWmD6c()
+                        && playbackController.isPlaying();
+                if (liveD6cMeter) {
+                    playbackController.getAudioMeterLevels(playbackMeterLevels);
+                    nextTickMs = 50L;
+                } else {
+                    playbackMeterLevels[0] = 0f;
+                    playbackMeterLevels[1] = 0f;
+                }
+                walkTapeView.setAudioMeterLevels(
+                        playbackMeterLevels[0], playbackMeterLevels[1]);
             }
-            progressHandler.postDelayed(this, 180);
+            progressHandler.postDelayed(this, nextTickMs);
         }
     };
     private final ConnectivityManager.NetworkCallback lyricsNetworkCallback =
@@ -94,11 +110,22 @@ public class MainActivity extends AppCompatActivity implements
         TapeStockProfile savedTapeProfile = TapeStockProfile.forId(
                 getSharedPreferences(PREFERENCES, MODE_PRIVATE)
                         .getString(KEY_TAPE_PROFILE, TapeStockProfile.SONY_CHF_1978));
+        MachineConditionProfile savedCondition = MachineConditionProfile.forId(
+                getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                        .getString(KEY_MACHINE_CONDITION,
+                                MachineConditionProfile.CALIBRATED));
+        DolbyMode savedDolbyMode = DolbyMode.forId(
+                getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                        .getString(KEY_DOLBY_MODE, DolbyMode.OFF.id));
         playbackController.setMachineProfile(savedProfile);
         playbackController.setTapeProfile(savedTapeProfile);
+        playbackController.setConditionProfile(savedCondition);
+        playbackController.setDolbyMode(savedDolbyMode);
         walkTapeView.setMachineProfile(savedProfile);
         walkTapeView.setTapeProfile(savedTapeProfile);
-        if (savedProfile.isAiwaHsJx707()) {
+        walkTapeView.setConditionProfile(savedCondition);
+        walkTapeView.setDolbyMode(savedDolbyMode);
+        if (savedProfile.usesTapeTypeSelector()) {
             boolean highPosition = savedTapeProfile.isHighPosition();
             playbackController.setHighTape(highPosition);
             walkTapeView.setHighTape(highPosition);
@@ -282,6 +309,16 @@ public class MainActivity extends AppCompatActivity implements
     }
 
     @Override
+    public void onDolbyModeChanged(DolbyMode mode) {
+        DolbyMode selected = mode == null ? DolbyMode.OFF : mode;
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_DOLBY_MODE, selected.id)
+                .apply();
+        playbackController.setDolbyMode(selected);
+    }
+
+    @Override
     public void onMachineProfileChanged(TapeMachineProfile profile) {
         if (profile == null) {
             return;
@@ -307,6 +344,18 @@ public class MainActivity extends AppCompatActivity implements
                 .putString(KEY_TAPE_PROFILE, profile.id)
                 .apply();
         playbackController.setTapeProfile(profile);
+    }
+
+    @Override
+    public void onConditionProfileChanged(MachineConditionProfile profile) {
+        if (profile == null) {
+            return;
+        }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_MACHINE_CONDITION, profile.id)
+                .apply();
+        playbackController.setConditionProfile(profile);
     }
 
     @Override

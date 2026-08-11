@@ -73,9 +73,12 @@ public final class PlaybackController {
     private volatile CatalogModels.Track currentTrack;
     private volatile float ducking = 1f;
     private volatile boolean highTape = true;
+    private volatile DolbyMode dolbyMode = DolbyMode.OFF;
     private volatile TapeMachineProfile machineProfile =
             TapeMachineProfile.sonyTpsL2Reference();
     private volatile TapeStockProfile tapeProfile = TapeStockProfile.sonyChf1978();
+    private volatile MachineConditionProfile conditionProfile =
+            MachineConditionProfile.calibrated();
 
     public PlaybackController(Context context, Listener listener) {
         appContext = context.getApplicationContext();
@@ -110,7 +113,9 @@ public final class PlaybackController {
         next.setDucking(ducking);
         next.setMachineProfile(machineProfile);
         next.setTapeProfile(tapeProfile);
+        next.setConditionProfile(conditionProfile);
         next.setHighTape(highTape);
+        next.setDolbyMode(dolbyMode);
         session = next;
         next.start();
     }
@@ -148,6 +153,20 @@ public final class PlaybackController {
     public long getDurationMs() {
         DecoderSession active = session;
         return active == null ? 0 : active.durationMs;
+    }
+
+    /** Returns the final post-tape/post-machine peaks aligned to the audible AudioTrack head. */
+    public void getAudioMeterLevels(float[] destination) {
+        if (destination == null || destination.length < 2) {
+            throw new IllegalArgumentException("Two meter channels are required");
+        }
+        DecoderSession active = session;
+        if (active == null || !active.isPlaying()) {
+            destination[0] = 0f;
+            destination[1] = 0f;
+            return;
+        }
+        active.getAudioMeterLevels(destination);
     }
 
     public void seekToFraction(float fraction) {
@@ -195,6 +214,19 @@ public final class PlaybackController {
         }
     }
 
+    public void setDolbyMode(DolbyMode mode) {
+        DolbyMode selected = mode == null ? DolbyMode.OFF : mode;
+        dolbyMode = selected;
+        DecoderSession active = session;
+        if (active != null) {
+            active.setDolbyMode(selected);
+        }
+    }
+
+    DolbyMode getDolbyModeForTest() {
+        return dolbyMode;
+    }
+
     public void setMachineProfile(TapeMachineProfile profile) {
         TapeMachineProfile selected = profile == null
                 ? TapeMachineProfile.sonyTpsL2Reference()
@@ -223,6 +255,21 @@ public final class PlaybackController {
 
     TapeStockProfile getTapeProfileForTest() {
         return tapeProfile;
+    }
+
+    public void setConditionProfile(MachineConditionProfile profile) {
+        MachineConditionProfile selected = profile == null
+                ? MachineConditionProfile.calibrated()
+                : MachineConditionProfile.forId(profile.id);
+        conditionProfile = selected;
+        DecoderSession active = session;
+        if (active != null) {
+            active.setConditionProfile(selected);
+        }
+    }
+
+    MachineConditionProfile getConditionProfileForTest() {
+        return conditionProfile;
     }
 
     public synchronized void release() {
@@ -330,14 +377,18 @@ public final class PlaybackController {
         private volatile long fallbackPositionMs;
         private volatile float sessionDucking = 1f;
         private volatile boolean sessionHighTape;
+        private volatile DolbyMode sessionDolbyMode = DolbyMode.OFF;
         private volatile TapeMachineProfile sessionProfile =
                 TapeMachineProfile.sonyTpsL2Reference();
         private volatile TapeStockProfile sessionTapeProfile = TapeStockProfile.sonyChf1978();
+        private volatile MachineConditionProfile sessionConditionProfile =
+                MachineConditionProfile.calibrated();
         private volatile AudioTrack audioTrack;
         private volatile PcmWriter pcmWriter;
         private volatile TapeMachineDsp dsp;
         private volatile String dspProfileId;
         private volatile String dspTapeProfileId;
+        private volatile String dspConditionProfileId;
         private volatile boolean outputStarted;
 
         private MediaExtractor extractor;
@@ -357,6 +408,7 @@ public final class PlaybackController {
         private volatile long mediaAnchorUs;
         private volatile long stereoFramesWritten;
         private volatile int audioPrimeMs = AUDIO_PRIME_MS;
+        private final AudioLevelTimeline audioLevels = new AudioLevelTimeline();
         private boolean preparedCallbackSent;
         private float[] stereoBuffer = new float[0];
         private float[] resampledBuffer = new float[0];
@@ -481,6 +533,10 @@ public final class PlaybackController {
             }
         }
 
+        void getAudioMeterLevels(float[] destination) {
+            audioLevels.sample(getPositionMs() * 1_000L, destination);
+        }
+
         void seekTo(long positionMs) {
             requestSeek(positionMs, AUDIO_PRIME_MS, false);
         }
@@ -498,6 +554,7 @@ public final class PlaybackController {
                 fallbackPositionMs = Math.max(0, positionMs);
                 playbackAnchorSet = false;
                 stereoFramesWritten = 0L;
+                audioLevels.clear();
 
                 PcmWriter writer = pcmWriter;
                 if (writer != null) {
@@ -552,6 +609,25 @@ public final class PlaybackController {
             }
         }
 
+        void setDolbyMode(DolbyMode mode) {
+            DolbyMode selected = mode == null ? DolbyMode.OFF : mode;
+            boolean changed = sessionDolbyMode != selected;
+            sessionDolbyMode = selected;
+            TapeMachineDsp renderer = dsp;
+            if (renderer != null) {
+                renderer.setDolbyMode(selected);
+            }
+            if (changed && prepared && !finished && !stopRequested) {
+                // Dolby changes the encoded tape drive and its complementary replay path. Flush
+                // already-rendered PCM and rebuild from the audible head, just like moving the
+                // physical selector before continuing the tape.
+                // C-type adds two complementary sliding-band stages. Give the exact renderer the
+                // same reserve as a fresh start so the selector cannot restart AudioTrack with
+                // only the lightweight tone-switch cushion, especially after 192 kHz resampling.
+                requestSeek(getPositionMs(), AUDIO_PRIME_MS, false);
+            }
+        }
+
         void setMachineProfile(TapeMachineProfile profile) {
             TapeMachineProfile selected = profile == null
                     ? TapeMachineProfile.sonyTpsL2Reference()
@@ -573,6 +649,19 @@ public final class PlaybackController {
             sessionTapeProfile = selected;
             if (changed && prepared && !finished && !stopRequested) {
                 // Re-enter at the audible playhead so queued PCM cannot mix two tape stocks.
+                requestSeek(getPositionMs(), TONE_CHANGE_PRIME_MS, false);
+            }
+        }
+
+        void setConditionProfile(MachineConditionProfile profile) {
+            MachineConditionProfile selected = profile == null
+                    ? MachineConditionProfile.calibrated()
+                    : MachineConditionProfile.forId(profile.id);
+            boolean changed = !selected.id.equals(sessionConditionProfile.id);
+            sessionConditionProfile = selected;
+            if (changed && prepared && !finished && !stopRequested) {
+                // Condition affects already-rendered transport/head PCM, so rebuild at the audible
+                // playhead instead of mixing old and new unit tolerances in the look-ahead queue.
                 requestSeek(getPositionMs(), TONE_CHANGE_PRIME_MS, false);
             }
         }
@@ -941,6 +1030,7 @@ public final class PlaybackController {
             }
 
             releaseAudioTrack();
+            audioLevels.clear();
             int minimum = AudioTrack.getMinBufferSize(renderSampleRate,
                     AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_FLOAT);
             if (minimum <= 0) {
@@ -965,11 +1055,14 @@ public final class PlaybackController {
             rateConverter = sampleRate == renderSampleRate
                     ? null : new PcmRateConverter(sampleRate, renderSampleRate);
             TapeMachineDsp renderer = TapeMachineDspFactory.create(
-                    sessionProfile, sessionTapeProfile, renderSampleRate);
+                    sessionProfile, sessionTapeProfile, sessionConditionProfile,
+                    renderSampleRate);
             renderer.setHighTape(sessionHighTape);
+            renderer.setDolbyMode(sessionDolbyMode);
             dsp = renderer;
             dspProfileId = sessionProfile.id;
             dspTapeProfileId = sessionTapeProfile.id;
+            dspConditionProfileId = sessionConditionProfile.id;
             audioTrack = output;
             outputStarted = false;
             audioPrimeMs = AUDIO_PRIME_MS;
@@ -1250,7 +1343,17 @@ public final class PlaybackController {
             if (hasPendingSeek()) {
                 return;
             }
-            writeStereoFloat(renderBuffer, requiredSamples, firstAudibleUs);
+            if (writeStereoFloat(renderBuffer, requiredSamples, firstAudibleUs)) {
+                synchronized (controlLock) {
+                    // If a seek/profile rebuild lands after enqueue, requestSeek() either waits
+                    // for this short scan and clears it afterwards, or this branch observes the
+                    // pending seek and does not reintroduce stale visual levels.
+                    if (pendingSeekUs == NO_SEEK && !stopRequested) {
+                        audioLevels.recordPcm(firstAudibleUs, outputSampleRate,
+                                renderBuffer, renderFrames);
+                    }
+                }
+            }
         }
 
         private void copyFloatChannelsToStereo(float[] source,
@@ -1268,16 +1371,17 @@ public final class PlaybackController {
             }
         }
 
-        private void writeStereoFloat(float[] samples, int sampleCount, long presentationUs)
+        private boolean writeStereoFloat(float[] samples, int sampleCount, long presentationUs)
                 throws Exception {
             PcmWriter writer = pcmWriter;
             if (writer == null) {
                 throw new PlaybackFailure("音频输出已关闭");
             }
             if (!writer.enqueue(samples, sampleCount, presentationUs)) {
-                return;
+                return false;
             }
             fallbackPositionMs = Math.max(0, presentationUs / 1_000L);
+            return true;
         }
 
         /** @return true after drain, false when a seek should restart decoding. */
@@ -1347,18 +1451,23 @@ public final class PlaybackController {
             playbackAnchorSet = false;
             stereoFramesWritten = 0;
             fallbackPositionMs = seekUs / 1_000L;
+            audioLevels.clear();
             TapeMachineDsp renderer = dsp;
             TapeMachineProfile selectedProfile = sessionProfile;
             TapeStockProfile selectedTapeProfile = sessionTapeProfile;
+            MachineConditionProfile selectedConditionProfile = sessionConditionProfile;
             if (renderer == null || dspProfileId == null
                     || !dspProfileId.equals(selectedProfile.id)
                     || dspTapeProfileId == null
-                    || !dspTapeProfileId.equals(selectedTapeProfile.id)) {
+                    || !dspTapeProfileId.equals(selectedTapeProfile.id)
+                    || dspConditionProfileId == null
+                    || !dspConditionProfileId.equals(selectedConditionProfile.id)) {
                 renderer = TapeMachineDspFactory.create(selectedProfile,
-                        selectedTapeProfile, outputSampleRate);
+                        selectedTapeProfile, selectedConditionProfile, outputSampleRate);
                 dsp = renderer;
                 dspProfileId = selectedProfile.id;
                 dspTapeProfileId = selectedTapeProfile.id;
+                dspConditionProfileId = selectedConditionProfile.id;
                 consumedSeekPreservesDsp = false;
             }
             if (renderer != null) {
@@ -1366,6 +1475,7 @@ public final class PlaybackController {
                     renderer.reset();
                 }
                 renderer.setHighTape(sessionHighTape);
+                renderer.setDolbyMode(sessionDolbyMode);
             }
             consumedSeekPreservesDsp = false;
             PcmRateConverter converter = rateConverter;
@@ -1681,6 +1791,7 @@ public final class PlaybackController {
         }
 
         private void releaseDecoderResources() {
+            audioLevels.clear();
             if (codec != null) {
                 try {
                     codec.stop();
@@ -1975,7 +2086,7 @@ public final class PlaybackController {
     /**
      * Streaming anti-alias FIR decimator for high-resolution sources.
      *
-     * <p>Neither reference machine reproduces content above 12.5 kHz, so running the nonlinear
+     * <p>No current reference machine reproduces content above 15 kHz, so running the nonlinear
      * and mechanical model at 96/192 kHz wastes most of the phone's CPU on an inaudible band.
      * This converter keeps
      * the complete machine bandwidth, rejects ultrasonic aliases, and preserves phase continuity

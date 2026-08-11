@@ -11,6 +11,8 @@ import java.util.List;
  */
 public final class TapeMachineProfile {
     public static final String SONY_TPS_L2 = "sony_tps_l2";
+    public static final String SONY_WM_F2015 = "sony_wm_f2015";
+    public static final String SONY_WM_D6C = "sony_wm_d6c";
     public static final String AIWA_HS_JX707 = "aiwa_hs_jx707";
 
     private static final TapeMachineProfile TPS_L2_REFERENCE = new TapeMachineProfile(
@@ -55,8 +57,51 @@ public final class TapeMachineProfile {
             false
     );
 
+    private static final TapeMachineProfile WM_F2015_REFERENCE = new TapeMachineProfile(
+            SONY_WM_F2015,
+            "SONY",
+            "WM-F2015",
+            1990,
+            40,
+            15_000,
+            0.340f,
+            -65f,
+            0f,
+            "DUAL BELT / MANUAL",
+            "1991 SONY SERVICE CIRCUIT / SPEED LIMIT",
+            "40 Hz — 15 kHz",
+            "0.340% RMS MODEL · SPEED ±0.5%",
+            "NOISE REDUCTION",
+            "NONE · LA4570M",
+            "Cr/METAL",
+            "NORMAL",
+            false
+    );
+
+    private static final TapeMachineProfile WM_D6C_REFERENCE = new TapeMachineProfile(
+            SONY_WM_D6C,
+            "SONY",
+            "WM-D6C",
+            1984,
+            40,
+            15_000,
+            0.040f,
+            -58f,
+            0f,
+            "QUARTZ-LOCKED DISC DRIVE",
+            "1984 SONY SERVICE MANUAL / NAB WRMS",
+            "40 Hz — 15 kHz",
+            "0.040% WRMS  ·  ±0.14% DIN",
+            "SIGNAL / NOISE",
+            "58 dB  ·  TYPE II/IV  ·  NR OFF",
+            "CrO₂ / METAL",
+            "NORMAL",
+            false
+    );
+
     private static final List<TapeMachineProfile> AVAILABLE = Collections.unmodifiableList(
-            Arrays.asList(TPS_L2_REFERENCE, JX707_REFERENCE));
+            Arrays.asList(TPS_L2_REFERENCE, WM_F2015_REFERENCE, JX707_REFERENCE,
+                    WM_D6C_REFERENCE));
 
     public final String id;
     public final String manufacturer;
@@ -123,11 +168,25 @@ public final class TapeMachineProfile {
         return JX707_REFERENCE;
     }
 
+    public static TapeMachineProfile sonyWmF2015Reference() {
+        return WM_F2015_REFERENCE;
+    }
+
+    public static TapeMachineProfile sonyWmD6cReference() {
+        return WM_D6C_REFERENCE;
+    }
+
     public static List<TapeMachineProfile> availableProfiles() {
         return AVAILABLE;
     }
 
     public static TapeMachineProfile forId(String id) {
+        if (SONY_WM_F2015.equals(id)) {
+            return WM_F2015_REFERENCE;
+        }
+        if (SONY_WM_D6C.equals(id)) {
+            return WM_D6C_REFERENCE;
+        }
         if (AIWA_HS_JX707.equals(id)) {
             return JX707_REFERENCE;
         }
@@ -138,9 +197,45 @@ public final class TapeMachineProfile {
         return AIWA_HS_JX707.equals(id);
     }
 
+    public boolean isSonyWmF2015() {
+        return SONY_WM_F2015.equals(id);
+    }
+
+    public boolean isSonyWmD6c() {
+        return SONY_WM_D6C.equals(id);
+    }
+
+    public boolean usesTapeTypeSelector() {
+        return isSonyWmF2015() || isAiwaHsJx707() || isSonyWmD6c();
+    }
+
+    public boolean supportsDolbyBC() {
+        return isAiwaHsJx707() || isSonyWmD6c();
+    }
+
+    public String noiseSpecValue(DolbyMode mode, TapeStockProfile tape) {
+        DolbyMode selected = supportsDolbyBC() && mode != null ? mode : DolbyMode.OFF;
+        if (isSonyWmD6c()) {
+            boolean typeOne = tape == null || TapeStockProfile.forId(tape.id).iecType == 1;
+            int signalToNoise = typeOne
+                    ? selected == DolbyMode.C ? 67 : selected == DolbyMode.B ? 61 : 54
+                    : selected == DolbyMode.C ? 71 : selected == DolbyMode.B ? 65 : 58;
+            return signalToNoise + " dB  ·  TYPE " + (typeOne ? "I" : "II/IV")
+                    + "  ·  NR " + selected.label;
+        }
+        if (selected == DolbyMode.OFF) {
+            return noiseSpecValue;
+        }
+        return ">45 dB BASE  ·  DOLBY " + selected.label + " / "
+                + selected.maximumNoiseReductionDb + " dB HF";
+    }
+
     public String frequencySpec(boolean highTape) {
         if (isAiwaHsJx707() && !highTape) {
             return "63 Hz — 8 kHz";
+        }
+        if (isSonyWmF2015() && !highTape) {
+            return "40 Hz — 11.6 kHz MODEL";
         }
         return highTapeFrequencySpec;
     }

@@ -125,7 +125,7 @@ public class WalkTapeViewRenderTest {
         tap(624, 93); // machine-room button beside the live library indicator
         Bitmap selector = settleAndRender(1080, 2160);
         save(selector, "10-machine-room.png");
-        tap(520, 1_180); // Aiwa HS-JX707 profile card
+        tap(520, 1_295); // Aiwa HS-JX707 profile card
         settleAndRender(1080, 2160);
 
         assertEquals(TapeMachineProfile.AIWA_HS_JX707, view.getMachineProfile().id);
@@ -146,6 +146,104 @@ public class WalkTapeViewRenderTest {
     }
 
     @Test
+    public void machineRoomSelectsAndRendersTheSonyWmF2015Profile() throws IOException {
+        MachineListener listener = new MachineListener();
+        view.setListener(listener);
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+
+        tap(624, 93);
+        settleAndRender(1080, 2160);
+        tap(520, 1_100); // Sony WM-F2015 profile card
+        settleAndRender(1080, 2160);
+
+        assertEquals(TapeMachineProfile.SONY_WM_F2015, view.getMachineProfile().id);
+        assertEquals(1, listener.profileChanges);
+        assertEquals(TapeMachineProfile.SONY_WM_F2015, listener.lastProfile.id);
+
+        tap(210, 610);
+        settleAndRender(1080, 2160);
+        tap(790, 560);
+        settleAndRender(1080, 2160);
+        tap(300, 1100);
+        layout(2160, 1080);
+        Bitmap f2015Player = settleAndRender(2160, 1080);
+        save(f2015Player, "16-player-sony-wm-f2015.png");
+
+        assertTrue(new File(outputDirectory(),
+                "16-player-sony-wm-f2015.png").length() > 40_000);
+    }
+
+    @Test
+    public void d6cRendersLiveMeterAndSupportsLockedDistractionFreeView() throws IOException {
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+        tap(624, 93);
+        settleAndRender(1080, 2160);
+        tap(520, 1_400); // fourth machine card: WM-D6C
+        settleAndRender(1080, 2160);
+        assertEquals(TapeMachineProfile.SONY_WM_D6C, view.getMachineProfile().id);
+        tap(210, 610);
+        settleAndRender(1080, 2160);
+        tap(790, 560);
+        settleAndRender(1080, 2160);
+        tap(300, 1100);
+        layout(2160, 1080);
+        view.setAudioMeterLevels(0.72f, 0.18f);
+        Bitmap player = settleAndRender(2160, 1080);
+        save(player, "17-player-sony-wm-d6c-meter.png");
+        assertTrue(view.audioMeterDisplayForTest() > 0.65f);
+
+        tap(180, 500); // blank left portion of the machine body
+        Bitmap fullScreen = settleAndRender(2160, 1080);
+        save(fullScreen, "18-player-sony-wm-d6c-fullscreen.png");
+        assertTrue(view.playerInfoHiddenForTest());
+
+        tap(1_920, 100); // lock pill follows the expanded machine's upper-right edge
+        assertTrue(view.playerViewLockedForTest());
+        tap(300, 400);
+        assertTrue("A locked presentation must ignore body taps",
+                view.playerInfoHiddenForTest());
+        tap(1_920, 100);
+        assertTrue(!view.playerViewLockedForTest());
+        tap(300, 400);
+        assertTrue(!view.playerInfoHiddenForTest());
+
+        assertTrue(new File(outputDirectory(),
+                "17-player-sony-wm-d6c-meter.png").length() > 40_000);
+        assertTrue(new File(outputDirectory(),
+                "18-player-sony-wm-d6c-fullscreen.png").length() > 40_000);
+    }
+
+    @Test
+    public void d6cAndAiwaDolbyControlsSelectAllRealPositions() throws IOException {
+        DolbyListener listener = new DolbyListener();
+        view.setListener(listener);
+        view.setMachineProfile(TapeMachineProfile.sonyWmD6cReference());
+        enterFirstTrackInPlayer();
+
+        tap(1_188, 400); // D6C selector centre: B
+        assertEquals(DolbyMode.B, view.getDolbyMode());
+        save(settleAndRender(2160, 1080), "19-player-sony-wm-d6c-dolby-b.png");
+        tap(1_188, 370); // D6C selector top: C
+        assertEquals(DolbyMode.C, view.getDolbyMode());
+        tap(1_188, 430); // D6C selector bottom: OFF
+        assertEquals(DolbyMode.OFF, view.getDolbyMode());
+        assertEquals(3, listener.changes);
+
+        view.setMachineProfile(TapeMachineProfile.aiwaHsJx707Reference());
+        settleAndRender(2160, 1080);
+        tap(270, 150); // JX707 DOLBY key cycles the LCD state.
+        assertEquals(DolbyMode.B, view.getDolbyMode());
+        tap(270, 150);
+        assertEquals(DolbyMode.C, view.getDolbyMode());
+        save(settleAndRender(2160, 1080), "20-player-aiwa-jx707-dolby-c.png");
+        tap(270, 150);
+        assertEquals(DolbyMode.OFF, view.getDolbyMode());
+        assertEquals(6, listener.changes);
+    }
+
+    @Test
     public void signalChainTapeTabSelectsAndRendersARealTapeStock() throws IOException {
         MachineListener listener = new MachineListener();
         view.setListener(listener);
@@ -154,7 +252,7 @@ public class WalkTapeViewRenderTest {
 
         tap(624, 93);
         settleAndRender(1080, 2160);
-        tap(760, 790); // TAPE STOCK tab
+        tap(540, 790); // TAPE STOCK tab
         Bitmap tapeSelector = settleAndRender(1080, 2160);
         save(tapeSelector, "12-tape-stock-selector.png");
         tap(520, 1_155); // TDK SA Type II card
@@ -175,6 +273,38 @@ public class WalkTapeViewRenderTest {
 
         assertTrue(new File(outputDirectory(), "12-tape-stock-selector.png").length() > 40_000);
         assertTrue(new File(outputDirectory(), "13-player-tdk-sa.png").length() > 40_000);
+    }
+
+    @Test
+    public void conditionTabSelectsHealthyUnitImperfectionAndRendersIt() throws IOException {
+        MachineListener listener = new MachineListener();
+        view.setListener(listener);
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+
+        tap(624, 93);
+        settleAndRender(1080, 2160);
+        tap(840, 790); // CONDITION tab
+        Bitmap conditionSelector = settleAndRender(1080, 2160);
+        save(conditionSelector, "14-condition-selector.png");
+        tap(520, 1_340); // LIVED-IN, still healthy unit
+        settleAndRender(1080, 2160);
+
+        assertEquals(MachineConditionProfile.LIVED_IN, view.getConditionProfile().id);
+        assertEquals(1, listener.conditionProfileChanges);
+        assertEquals(MachineConditionProfile.LIVED_IN, listener.lastConditionProfile.id);
+
+        tap(210, 610);
+        settleAndRender(1080, 2160);
+        tap(790, 560);
+        settleAndRender(1080, 2160);
+        tap(300, 1100);
+        layout(2160, 1080);
+        Bitmap conditionPlayer = settleAndRender(2160, 1080);
+        save(conditionPlayer, "15-player-lived-in.png");
+
+        assertTrue(new File(outputDirectory(), "14-condition-selector.png").length() > 40_000);
+        assertTrue(new File(outputDirectory(), "15-player-lived-in.png").length() > 40_000);
     }
 
     @Test
@@ -526,6 +656,18 @@ public class WalkTapeViewRenderTest {
                 now, now + 40, MotionEvent.ACTION_UP, toX, toY, 0));
     }
 
+    private void enterFirstTrackInPlayer() {
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+        tap(210, 610);
+        settleAndRender(1080, 2160);
+        tap(790, 560);
+        settleAndRender(1080, 2160);
+        tap(300, 1100);
+        layout(2160, 1080);
+        settleAndRender(2160, 1080);
+    }
+
     private void save(Bitmap bitmap, String name) throws IOException {
         File directory = outputDirectory();
         assertTrue(directory.exists() || directory.mkdirs());
@@ -607,6 +749,22 @@ public class WalkTapeViewRenderTest {
         }
     }
 
+    private static final class DolbyListener implements WalkTapeView.Listener {
+        int changes;
+
+        @Override public void onImportRequested() { }
+        @Override public void onTrackSelected(CatalogModels.Album album, CatalogModels.Track track) { }
+        @Override public void onReturnToPlayer() { }
+        @Override public void onPlayPauseRequested() { }
+        @Override public void onStopRequested() { }
+        @Override public void onSkipRequested(int direction) { }
+        @Override public void onSeekRequested(float fraction) { }
+        @Override public void onExitPlayer() { }
+        @Override public void onHotlineChanged(boolean active) { }
+        @Override public void onToneChanged(boolean highTape) { }
+        @Override public void onDolbyModeChanged(DolbyMode mode) { changes++; }
+    }
+
     private static final class MiniPlayerListener implements WalkTapeView.Listener {
         int trackLoads;
         int playerReturns;
@@ -650,9 +808,11 @@ public class WalkTapeViewRenderTest {
     private static final class MachineListener implements WalkTapeView.Listener {
         int profileChanges;
         int tapeProfileChanges;
+        int conditionProfileChanges;
         int hotlineChanges;
         TapeMachineProfile lastProfile;
         TapeStockProfile lastTapeProfile;
+        MachineConditionProfile lastConditionProfile;
 
         @Override public void onImportRequested() { }
         @Override public void onTrackSelected(CatalogModels.Album album, CatalogModels.Track track) { }
@@ -671,6 +831,10 @@ public class WalkTapeViewRenderTest {
         @Override public void onTapeProfileChanged(TapeStockProfile profile) {
             tapeProfileChanges++;
             lastTapeProfile = profile;
+        }
+        @Override public void onConditionProfileChanged(MachineConditionProfile profile) {
+            conditionProfileChanges++;
+            lastConditionProfile = profile;
         }
     }
 }

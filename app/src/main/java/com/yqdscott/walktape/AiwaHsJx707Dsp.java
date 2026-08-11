@@ -3,7 +3,7 @@ package com.yqdscott.walktape;
 import java.util.Arrays;
 
 /**
- * Realtime reference model of a serviced Aiwa HS-JX707 with BBE, DSL and Dolby disabled.
+ * Realtime machine-only reference model of a serviced Aiwa HS-JX707 with BBE and DSL disabled.
  *
  * <p>No trustworthy per-frequency sweep of a correctly aligned JX707 is publicly available.
  * This renderer therefore models the audio path against Aiwa's 1992 service limits: the manual
@@ -14,8 +14,9 @@ import java.util.Arrays;
  * not a claim that every surviving machine measures identically.</p>
  *
  * <p>Production playback supplies magnetic non-linearity and tape hiss through the independent
- * {@link TapeMediumDsp}; the package-private machine-only constructor prevents those media
- * effects from being counted twice while retaining the JX707 mechanics and electronics.</p>
+ * {@link TapeMediumDsp}; {@link DolbyNoiseReductionDsp} supplies the service-manual-confirmed
+ * B/C path around that medium. The package-private machine-only constructor prevents those
+ * media effects from being counted twice while retaining the JX707 mechanics and electronics.</p>
  */
 public final class AiwaHsJx707Dsp implements TapeMachineDsp {
     private static final double TWO_PI = Math.PI * 2.0;

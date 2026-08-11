@@ -4,6 +4,10 @@ package com.yqdscott.walktape;
 interface TapeMachineDsp {
     void setHighTape(boolean enabled);
 
+    /** Unsupported machines deliberately keep the inherited no-op implementation. */
+    default void setDolbyMode(DolbyMode mode) {
+    }
+
     void reset();
 
     void process(float[] stereo, int frameCount);
