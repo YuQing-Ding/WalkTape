@@ -10,13 +10,16 @@ The current milestone rebuilds the original prototype's interface, playback tran
 - A two-part open case with an acrylic J-card tray and animated cassette
 - An unfolding J-card with liner notes, track list, lyrics, paper folds, and scrolling
 - A track-selection drawer that rotates into a landscape playback scene
-- Code-drawn Sony TPS-L2 and Aiwa HS-JX707 players with moving reels, tape-pack progression, physical controls, and machine-specific behaviour
+- Code-drawn Sony TPS-L2, Sony WM-F2015, Sony WM-D6C, and Aiwa HS-JX707 players with moving reels, tape-pack progression, physical controls, and machine-specific behaviour
 - Local MediaStore album grouping and embedded artwork loading
 - A stereo PCM playback engine for AAC/M4A, ALAC/M4A, FLAC, MP3, WAV/PCM, Ogg/Vorbis, and Opus, including a bundled ALAC fallback
-- A selectable machine DSP layer with independent TPS-L2 and HS-JX707 response, transport, head, electronics, and mechanical-noise models
+- A selectable machine DSP layer with independent TPS-L2, WM-F2015, WM-D6C, and HS-JX707 response, transport, head, electronics, and mechanical-noise models
+- A true post-DSP WM-D6C five-segment peak meter, aligned to the audible playhead rather than decoder look-ahead
+- Live Dolby OFF/B/C selectors on the WM-D6C and HS-JX707, backed by complementary sliding-band record/replay DSP rather than a tone-control preset
+- A distraction-free machine view for every profile: tap the chassis to hide/show playback information and use the on-machine lock to prevent accidental toggles
 - A separate magnetic-media layer for Sony CHF Type I, TDK SA Type II, and TDK MA-X Type IV, including 120/70 µs EQ, formulation-specific MOL/SOL, hysteretic saturation, programme-modulated particle noise, and coating wander
 
-Every decoded source is converted to interleaved stereo float PCM and passes through `TapeMediumDsp` before the selected machine renderer. Machine and tape can be switched live from the Signal Chain panel; both choices persist across launches.
+Every decoded source is converted to interleaved stereo float PCM. On supported machines the signal path is Dolby encode → `TapeMediumDsp` → Dolby decode → selected machine renderer; OFF bypasses both NR passes exactly. Machine, tape, Dolby mode, and healthy-unit condition can be switched live and persist across launches.
 
 ## Build
 
@@ -39,7 +42,7 @@ app/build/reports/walktape-renders/
 
 ## Audio engine
 
-The machine reference model and remaining physical-unit calibration work are documented in [docs/TPS_L2_AUDIO_PLAN.md](docs/TPS_L2_AUDIO_PLAN.md). The independent media model and its source data are documented in [docs/TAPE_MEDIA_MODEL.md](docs/TAPE_MEDIA_MODEL.md). The stricter “physical twin” badge remains reserved for repeatable capture matching across serviced machines and known tape samples.
+The machine references and remaining physical-unit calibration work are documented in [docs/TPS_L2_AUDIO_PLAN.md](docs/TPS_L2_AUDIO_PLAN.md), [docs/WM_F2015_AUDIO_PLAN.md](docs/WM_F2015_AUDIO_PLAN.md), and [docs/WM_D6C_AUDIO_PLAN.md](docs/WM_D6C_AUDIO_PLAN.md). The independent media and noise-reduction models are documented in [docs/TAPE_MEDIA_MODEL.md](docs/TAPE_MEDIA_MODEL.md) and [docs/DOLBY_BC_MODEL.md](docs/DOLBY_BC_MODEL.md). The stricter “physical twin” badge remains reserved for repeatable capture matching across serviced machines and known tape samples.
 
 ## License
 
