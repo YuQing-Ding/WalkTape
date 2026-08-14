@@ -1,10 +1,11 @@
 plugins {
-    alias(libs.plugins.android.application)
+    id 'com.android.application'
 }
 
 android {
     namespace 'com.yqdscott.walktape'
-    compileSdk 34
+    compileSdk 37
+    buildToolsVersion '36.0.0'
 
     defaultConfig {
         applicationId "com.yqdscott.walktape"
@@ -21,6 +22,19 @@ android {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
+        // Listenable build. Android refuses to compile a debuggable package beyond verification, so
+        // a debug build runs the whole tape renderer in ART's interpreter: measured at 985 ms of
+        // CPU per second of audio on a Pixel 8 against 21 ms for the same code compiled, which is
+        // far more than the audio pipeline can absorb and is heard as constant stuttering.
+        // This variant is simply the debug build without that flag, signed with the debug key so
+        // it installs alongside the normal workflow.
+        profile {
+            initWith debug
+            debuggable false
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+            matchingFallbacks = ['debug']
+        }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_11
@@ -30,17 +44,22 @@ android {
         unitTests.includeAndroidResources = true
     }
 }
+
+tasks.withType(JavaCompile).configureEach {
+    options.fork = true
+    options.incremental = false
+}
 dependencies {
 
-    implementation libs.appcompat
-    implementation libs.material
-    implementation libs.activity
-    implementation libs.constraintlayout
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.activity:activity:1.9.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     implementation files('libs/TarsosDSP-jvm-2.5.jar')
     implementation files('libs/TarsosDSP-Android-2.4.jar')
     implementation 'com.tianscar.javasound:jald:0.2.1'
-    testImplementation libs.junit
-    testImplementation libs.robolectric
-    androidTestImplementation libs.ext.junit
-    androidTestImplementation libs.espresso.core
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.16.1'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
 }

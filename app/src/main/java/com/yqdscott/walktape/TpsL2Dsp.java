@@ -76,6 +76,10 @@ public final class TpsL2Dsp implements TapeMachineDsp {
     private final CamTransport camTransport;
     private final TransportNoise transportNoise;
     private final MechanicalBed mechanicalBed;
+    private final TpsL2ElectromechanicalModel electromechanics;
+    private final TpsL2PlaybackElectronics playbackElectronics;
+    private final TpsL2TapeLayerBleed tapeLayerBleed;
+    private final float[] layerBleedFrame = new float[2];
     private final float saturationEnvelopeAttack;
     private final float saturationEnvelopeRelease;
 
@@ -89,6 +93,7 @@ public final class TpsL2Dsp implements TapeMachineDsp {
     private float azimuthInterpolationStep;
     private float startupSlowdown;
     private float startupDelaySamples;
+    private float electromechanicalDelaySamples;
     private int transportFramesUntilUpdate;
     private float highTapeMix;
     private float saturationEnvelope;
@@ -196,12 +201,43 @@ public final class TpsL2Dsp implements TapeMachineDsp {
                 noiseSeed ^ 0x5452414eL, RANDOM_TRANSPORT_SPEED_RMS,
                 TRANSPORT_CONTROL_STRIDE);
         mechanicalBed = new MechanicalBed(sampleRate, noiseSeed ^ 0x4d4f544f52L);
+        electromechanics = new TpsL2ElectromechanicalModel(sampleRate,
+                noiseSeed ^ 0x504f574552524149L);
+        playbackElectronics = new TpsL2PlaybackElectronics(sampleRate);
+        tapeLayerBleed = new TpsL2TapeLayerBleed(sampleRate);
         reset();
     }
 
     @Override
     public void setHighTape(boolean enabled) {
         highTape = enabled;
+    }
+
+    @Override
+    public void setTapePosition(float position) {
+        electromechanics.setTapePosition(position);
+        tapeLayerBleed.setTapePosition(position);
+    }
+
+    @Override
+    public void setTransportState(TapeTransportState state) {
+        electromechanics.setTransportState(state);
+    }
+
+    @Override
+    public void setBatteryDepthOfDischarge(float depth) {
+        electromechanics.setBatteryDepthOfDischarge(depth);
+    }
+
+    /**
+     * One supply-pack revolution, which is what the print-through pre-echo has to look ahead by.
+     *
+     * <p>Only the production machine stage carries the tape-layer model; the legacy self-contained
+     * path stays sample aligned.</p>
+     */
+    @Override
+    public int latencyFrames() {
+        return machineStageEnabled ? tapeLayerBleed.latencyFrames() : 0;
     }
 
     /** Clears all magnetic, transport and filter history after loading or seeking. */
@@ -229,6 +265,7 @@ public final class TpsL2Dsp implements TapeMachineDsp {
         azimuthInterpolationStep = 0f;
         startupSlowdown = STARTUP_SLOWDOWN;
         startupDelaySamples = 0f;
+        electromechanicalDelaySamples = 0f;
         transportFramesUntilUpdate = 0;
         saturationEnvelope = 0f;
         highTapeMix = highTape ? 1f : 0f;
@@ -245,12 +282,15 @@ public final class TpsL2Dsp implements TapeMachineDsp {
         noiseRight.reset();
         transportNoise.reset();
         mechanicalBed.reset();
+        electromechanics.reset();
+        playbackElectronics.reset();
+        tapeLayerBleed.reset();
     }
 
     /** Processes {@code frameCount} interleaved stereo float frames in place. */
     @Override
     public void process(float[] stereo, int frameCount) {
-        if (frameCount < 0 || frameCount * 2 > stereo.length) {
+        if (stereo == null || frameCount < 0 || frameCount > stereo.length / 2) {
             throw new IllegalArgumentException("Invalid stereo frame count");
         }
 
@@ -262,8 +302,8 @@ public final class TpsL2Dsp implements TapeMachineDsp {
         float currentHighTapeMix = highTapeMix;
         for (int frame = 0; frame < frameCount; frame++) {
             int sample = frame * 2;
-            float left = stereo[sample];
-            float right = stereo[sample + 1];
+            float left = finiteAudio(stereo[sample]);
+            float right = finiteAudio(stereo[sample + 1]);
 
             if (saturationEnabled) {
                 left = recordPreEmphasis.processLeft(left);
@@ -343,22 +383,40 @@ public final class TpsL2Dsp implements TapeMachineDsp {
                         + originalLeft * PROGRAM_CROSSTALK;
             }
 
+            if (machineStageEnabled) {
+                tapeLayerBleed.process(left, right, layerBleedFrame);
+                left = layerBleedFrame[0];
+                right = layerBleedFrame[1];
+            }
+
             if (hissEnabled) {
-                float mechanism = mechanicalBed.next();
+                float mechanism = mechanicalBed.next()
+                        * electromechanics.mechanicalNoiseGain();
+                mechanism += electromechanics.nextMechanicalTransient();
                 left += noiseLeft.next(programEnvelope) + mechanism * 1.04f;
                 right += noiseRight.next(programEnvelope) + mechanism * 0.91f;
             } else if (machineStageEnabled) {
-                float mechanism = mechanicalBed.next();
+                float mechanism = mechanicalBed.next()
+                        * electromechanics.mechanicalNoiseGain();
+                mechanism += electromechanics.nextMechanicalTransient();
                 left += mechanism * 1.04f;
                 right += mechanism * 0.91f;
             }
 
-            if (saturationEnabled || machineStageEnabled) {
-                stereo[sample] = analogueOutputStage(left);
-                stereo[sample + 1] = analogueOutputStage(right);
+            if (machineStageEnabled) {
+                float ripple = electromechanics.nextRailRipple();
+                float railScale = electromechanics.outputHeadroomScale();
+                playbackElectronics.beginFrame(left, right);
+                stereo[sample] = sanitizeOutput(
+                        playbackElectronics.processLeft(left, ripple, railScale));
+                stereo[sample + 1] = sanitizeOutput(
+                        playbackElectronics.processRight(right, ripple, railScale));
+            } else if (saturationEnabled) {
+                stereo[sample] = sanitizeOutput(analogueOutputStage(left));
+                stereo[sample + 1] = sanitizeOutput(analogueOutputStage(right));
             } else {
-                stereo[sample] = clamp(left);
-                stereo[sample + 1] = clamp(right);
+                stereo[sample] = sanitizeOutput(clamp(left));
+                stereo[sample + 1] = sanitizeOutput(clamp(right));
             }
         }
         highTapeMix = currentHighTapeMix;
@@ -394,6 +452,20 @@ public final class TpsL2Dsp implements TapeMachineDsp {
     /** Full-band RMS target used by the no-Dolby cassette renderer. */
     static float integratedHissFloorDb() {
         return linearToDb(INTEGRATED_HISS_RMS);
+    }
+
+    static float serviceManualTransportCurrentMilliamps(TapeTransportState state) {
+        if (state == TapeTransportState.FAST_FORWARD) {
+            return TpsL2ElectromechanicalModel.FAST_FORWARD_CURRENT_MA;
+        }
+        if (state == TapeTransportState.REWIND) {
+            return TpsL2ElectromechanicalModel.REWIND_CURRENT_MA;
+        }
+        return TpsL2ElectromechanicalModel.PLAY_CURRENT_MA;
+    }
+
+    static float serviceManualMainReservoirMicrofarads() {
+        return TpsL2ElectromechanicalModel.MAIN_RESERVOIR_UF;
     }
 
     private float wrapReadPosition(float position) {
@@ -440,8 +512,17 @@ public final class TpsL2Dsp implements TapeMachineDsp {
         // one-shot startup drift.
         startupDelaySamples += startupSlowdown * TRANSPORT_CONTROL_STRIDE;
         startupSlowdown *= startupDecay;
+        float camDelay = camTransport.nextDelaySamples();
+        float randomDelay = transportNoise.nextDelaySamples();
+        electromechanics.advanceControl(camTransport.currentLoad(),
+                transportNoise.normalisedContactLoad(),
+                playbackElectronics.programmePowerLoad());
+        electromechanicalDelaySamples += electromechanics.residualSpeedError()
+                * TRANSPORT_CONTROL_STRIDE;
+        electromechanicalDelaySamples = Math.max(-6f,
+                Math.min(6f, electromechanicalDelaySamples));
         float targetDelay = baseDelaySamples + startupDelaySamples
-                + camTransport.nextDelaySamples() + transportNoise.nextDelaySamples();
+                + electromechanicalDelaySamples + camDelay + randomDelay;
         for (int component = 0; component < transportSine.length; component++) {
             float sine = transportSine[component];
             float cosine = transportCosine[component];
@@ -496,6 +577,17 @@ public final class TpsL2Dsp implements TapeMachineDsp {
 
     private static float clamp(float value) {
         return Math.max(-0.995f, Math.min(0.995f, value));
+    }
+
+    private static float finiteAudio(float value) {
+        if (Float.isNaN(value) || Float.isInfinite(value)) {
+            return 0f;
+        }
+        return Math.max(-8f, Math.min(8f, value));
+    }
+
+    private static float sanitizeOutput(float value) {
+        return Float.isNaN(value) || Float.isInfinite(value) ? 0f : clamp(value);
     }
 
     private static float dbToLinear(float decibels) {
@@ -578,9 +670,11 @@ public final class TpsL2Dsp implements TapeMachineDsp {
         private static final float INITIAL_TABLE_PHASE = TABLE_SIZE * 0.37f;
 
         private final float[] delayTable = new float[TABLE_SIZE];
+        private final float[] loadTable = new float[TABLE_SIZE];
         private final float phaseStep;
         private final float maximumAbsDelaySamples;
         private float tablePhase;
+        private float currentLoad;
 
         CamTransport(int sampleRate) {
             double[] pulse = new double[TABLE_SIZE];
@@ -591,6 +685,7 @@ public final class TpsL2Dsp implements TapeMachineDsp {
                 double square = positive * positive;
                 double fourth = square * square;
                 pulse[index] = fourth * fourth;
+                loadTable[index] = (float) pulse[index];
                 mean += pulse[index];
             }
             mean /= TABLE_SIZE;
@@ -634,6 +729,7 @@ public final class TpsL2Dsp implements TapeMachineDsp {
 
         void reset() {
             tablePhase = INITIAL_TABLE_PHASE;
+            currentLoad = 0f;
         }
 
         float maximumAbsDelaySamples() {
@@ -649,11 +745,20 @@ public final class TpsL2Dsp implements TapeMachineDsp {
 
         float nextDelaySamples() {
             float result = currentDelaySamples();
+            int loadFirst = (int) tablePhase;
+            int loadSecond = (loadFirst + 1) & TABLE_MASK;
+            float loadFraction = tablePhase - loadFirst;
+            currentLoad = loadTable[loadFirst]
+                    + (loadTable[loadSecond] - loadTable[loadFirst]) * loadFraction;
             tablePhase += phaseStep;
             if (tablePhase >= TABLE_SIZE) {
                 tablePhase -= TABLE_SIZE;
             }
             return result;
+        }
+
+        float currentLoad() {
+            return currentLoad;
         }
     }
 
@@ -713,6 +818,10 @@ public final class TpsL2Dsp implements TapeMachineDsp {
         float contactGain() {
             float wander = Math.max(-2.5f, Math.min(2.5f, slow / slowRms));
             return 0.988f + wander * 0.007f;
+        }
+
+        float normalisedContactLoad() {
+            return Math.max(-1f, Math.min(1f, slow / (slowRms * 2.5f)));
         }
 
         private float nextWhite() {

@@ -16,6 +16,13 @@ public class TpsL2DspTest {
         assertEquals(1.2f, TpsL2Dsp.startupSpeedDeficitPercent(), 0.001f);
         assertEquals(15f, TpsL2Dsp.startupSettledSeconds(), 0.001f);
         assertEquals(2.78f, TpsL2Dsp.camWowPeriodSeconds(), 0.02f);
+        assertEquals(100f, TpsL2Dsp.serviceManualTransportCurrentMilliamps(
+                TapeTransportState.PLAYING), 0f);
+        assertEquals(105f, TpsL2Dsp.serviceManualTransportCurrentMilliamps(
+                TapeTransportState.FAST_FORWARD), 0f);
+        assertEquals(110f, TpsL2Dsp.serviceManualTransportCurrentMilliamps(
+                TapeTransportState.REWIND), 0f);
+        assertEquals(220f, TpsL2Dsp.serviceManualMainReservoirMicrofarads(), 0f);
     }
 
     @Test
@@ -158,6 +165,79 @@ public class TpsL2DspTest {
         for (int i = 0; i < a.length; i++) {
             assertEquals(a[i], b[i], 0f);
         }
+    }
+
+    @Test
+    public void revisedMachineStageIsFiniteAcrossRatesPositionsAndExtremeInput() {
+        int[] rates = {8_000, 11_025, 44_100, 48_000, 96_000};
+        float[] positions = {-1f, 0f, 0.5f, 1f, 2f, Float.NaN};
+        for (int rate : rates) {
+            for (float position : positions) {
+                TpsL2Dsp renderer = new TpsL2Dsp(rate, 99L,
+                        true, false, false, true);
+                renderer.setTapePosition(position);
+                renderer.setTransportState(TapeTransportState.PLAYING);
+                renderer.reset();
+                float[] block = new float[8_192 * 2];
+                for (int i = 0; i < block.length; i += 2) {
+                    block[i] = i % 14 == 0 ? Float.NaN : i % 10 == 0 ? Float.POSITIVE_INFINITY
+                            : i % 6 == 0 ? 6f : -6f;
+                    block[i + 1] = -block[i];
+                }
+                renderer.process(block, block.length / 2);
+                for (float sample : block) {
+                    assertTrue("Non-finite TPS-L2 output at " + rate + " Hz",
+                            !Float.isNaN(sample) && !Float.isInfinite(sample));
+                    assertTrue("TPS-L2 guard exceeded full scale", Math.abs(sample) <= 0.9951f);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void blockPartitionDoesNotChangeCoupledPhysicalState() {
+        TpsL2Dsp whole = new TpsL2Dsp(SAMPLE_RATE, 314L,
+                true, true, false, true);
+        TpsL2Dsp split = new TpsL2Dsp(SAMPLE_RATE, 314L,
+                true, true, false, true);
+        whole.setTapePosition(0.83f);
+        split.setTapePosition(0.83f);
+        whole.reset();
+        split.reset();
+        float[] a = sine(713f, 0.23f, 32_768);
+        float[] b = a.clone();
+        whole.process(a, 32_768);
+        int[] partitions = {1, 7, 31, 257, 1_024, 4_093, 8_191, 19_164};
+        int frameOffset = 0;
+        for (int frames : partitions) {
+            float[] part = new float[frames * 2];
+            System.arraycopy(b, frameOffset * 2, part, 0, part.length);
+            split.process(part, frames);
+            System.arraycopy(part, 0, b, frameOffset * 2, part.length);
+            frameOffset += frames;
+        }
+        assertEquals(32_768, frameOffset);
+        for (int i = 0; i < a.length; i++) {
+            assertEquals("Physical state must be independent of decoder buffer boundaries",
+                    a[i], b[i], 0f);
+        }
+    }
+
+    @Test
+    public void tapePackRadiusProducesARealLoadDifference() {
+        float start = TpsL2ElectromechanicalModel.positionLoadAt(0f);
+        float middle = TpsL2ElectromechanicalModel.positionLoadAt(0.5f);
+        float end = TpsL2ElectromechanicalModel.positionLoadAt(1f);
+        assertTrue(start > middle);
+        assertTrue(middle > end);
+        assertTrue("Pack-radius coupling must be large enough to reach the servo",
+                start - end > 0.15f);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void oversizedFrameCountIsRejectedWithoutIntegerOverflow() {
+        TpsL2Dsp renderer = cleanRenderer(false);
+        renderer.process(new float[2], Integer.MAX_VALUE);
     }
 
     private static TpsL2Dsp cleanRenderer(boolean highTape) {

@@ -41,7 +41,13 @@ public final class PlaybackKeepAliveService extends Service {
                 .putExtra(EXTRA_TITLE, track.title)
                 .putExtra(EXTRA_ARTIST, track.artist.isEmpty()
                         ? (album == null ? "" : album.artist) : track.artist);
-        ContextCompat.startForegroundService(context, intent);
+        try {
+            ContextCompat.startForegroundService(context, intent);
+        } catch (RuntimeException restricted) {
+            // Automatic track advance can land while the app is in the background, where newer
+            // releases reject a foreground-service start. Any already-running instance keeps the
+            // process promoted, so this must never be allowed to interrupt playback.
+        }
     }
 
     static void stop(Context context) {
@@ -73,7 +79,13 @@ public final class PlaybackKeepAliveService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         String title = intent == null ? "" : intent.getStringExtra(EXTRA_TITLE);
         String artist = intent == null ? "" : intent.getStringExtra(EXTRA_ARTIST);
-        startForeground(NOTIFICATION_ID, buildNotification(title, artist));
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification(title, artist));
+        } catch (RuntimeException rejected) {
+            // A rejected promotion costs process priority, but it must not take the audio engine
+            // down with it; the decoder keeps running and the user keeps hearing the tape.
+            stopSelf();
+        }
         return START_NOT_STICKY;
     }
 

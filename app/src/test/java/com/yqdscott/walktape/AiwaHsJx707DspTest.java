@@ -46,6 +46,49 @@ public class AiwaHsJx707DspTest {
                 metal12k5 - normal12k5 > 4.0);
     }
 
+    /**
+     * The bass end must come from C19 and R17, not from a spec-derived high-pass.
+     *
+     * <p>Below about 40 Hz the head contour prior has almost no say, so the rendered response
+     * should land on the traced network's own departure from the IEC curve. A 63 Hz Butterworth
+     * high-pass, which is what used to shape this end, would be roughly 20 dB down at 20 Hz
+     * instead of 4.5.</p>
+     */
+    @Test
+    public void theBassTurnoverIsTheTracedNetworksRatherThanASpecShelf() {
+        AiwaHsJx707ReplayEq reference = new AiwaHsJx707ReplayEq();
+        for (boolean metal : new boolean[]{false, true}) {
+            double treble = metal ? AiwaHsJx707ReplayEq.IEC_METAL_SECONDS
+                    : AiwaHsJx707ReplayEq.IEC_NORMAL_SECONDS;
+            for (double frequency : new double[]{20.0, 25.0, 31.5}) {
+                double expected = reference.relativeResponseDb(frequency, metal)
+                        - AiwaHsJx707ReplayEq.relativeTargetDb(frequency, treble);
+                assertEquals("Rendered bass must follow the solved network at " + frequency
+                                + " Hz, metal=" + metal,
+                        expected, responseDb((float) frequency, metal), 0.35);
+            }
+            assertTrue("A spec high-pass would bury 20 Hz far deeper than the network does",
+                    responseDb(20f, metal) > -6.0);
+        }
+    }
+
+    /**
+     * Through the midband the record pre-emphasis and its inverse cancel, leaving only the small
+     * derived error. Anything larger would mean the equaliser pair had stopped complementing.
+     */
+    @Test
+    public void theMidbandCarriesOnlyTheDerivedReplayError() {
+        for (boolean metal : new boolean[]{false, true}) {
+            for (float frequency : new float[]{63f, 100f, 200f, 400f, 800f, 2_000f}) {
+                double response = responseDb(frequency, metal);
+                assertTrue("Midband deviation at " + frequency + " Hz, metal=" + metal
+                        + " was " + response, Math.abs(response) < 1.2);
+            }
+        }
+        assertTrue("Cr/Metal must hold more treble than Normal once past the shelf",
+                responseDb(4_000f, true) > responseDb(4_000f, false));
+    }
+
     @Test
     public void renderedPitchMotionIsAudibleButRemainsBelowServiceLimit() {
         AiwaHsJx707Dsp renderer = new AiwaHsJx707Dsp(SAMPLE_RATE, 707L,

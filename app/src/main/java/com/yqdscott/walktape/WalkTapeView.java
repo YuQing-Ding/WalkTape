@@ -73,6 +73,9 @@ public final class WalkTapeView extends View {
         default void onTapeProfileChanged(TapeStockProfile profile) {
         }
 
+        default void onRecordLevelChanged(RecordLevelProfile level) {
+        }
+
         default void onConditionProfileChanged(MachineConditionProfile profile) {
         }
 
@@ -147,11 +150,30 @@ public final class WalkTapeView extends View {
     private static final String ACTION_SETTINGS = "settings";
     private static final String ACTION_SETTINGS_CLOSE = "settings_close";
     private static final String ACTION_SETTINGS_SECTION = "settings_section";
+    private static final String ACTION_RECORD_LEVEL = "record_level";
     private static final String ACTION_MACHINE_PROFILE = "machine_profile";
     private static final String ACTION_TAPE_PROFILE = "tape_profile";
     private static final String ACTION_CONDITION_PROFILE = "condition_profile";
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
+    /**
+     * Text is drawn with its own paint so its configuration can be left alone between calls.
+     *
+     * <p>Every {@code drawText} used to reconfigure the shared paint from scratch, and each of
+     * those setters is a JNI call that dirties the native paint. Setting a shader in particular
+     * forces Skia to rebuild its glyph strike, which is why text layout and strike lookup were the
+     * dominant cost of a player frame. A dedicated paint means the values below are only pushed
+     * across when they actually change.</p>
+     */
+    private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
+    private final android.text.TextPaint ellipsisPaint = new android.text.TextPaint();
+    private float textPaintSize = -1f;
+    private int textPaintColor = 0;
+    private android.graphics.Typeface textPaintFace;
+    private Paint.Align textPaintAlign;
+    private float textPaintLetterSpacing = Float.NaN;
+    /** Display density, refreshed once per frame instead of on each of the many dp() calls. */
+    private float density = 1f;
     private final Paint texturePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path path = new Path();
     private final Matrix bitmapMatrix = new Matrix();
@@ -199,6 +221,7 @@ public final class WalkTapeView extends View {
     private boolean hotlinePressActive;
     private boolean highTape = true;
     private DolbyMode dolbyMode = DolbyMode.OFF;
+    private RecordLevelProfile recordLevel = RecordLevelProfile.standard();
 
     // The machine chassis is almost entirely static but used to be rebuilt on every reel frame.
     // Cache it as one opaque frame, then redraw only the two reels and the live information panel.
@@ -263,6 +286,8 @@ public final class WalkTapeView extends View {
 
     public WalkTapeView(Context context, AttributeSet attrs) {
         super(context, attrs);
+        // dp() is reachable from layout and touch handling before the first frame is drawn.
+        density = getResources().getDisplayMetrics().density;
         setFocusable(true);
         setClickable(true);
         setContentDescription("WalkTape cassette library");
@@ -358,6 +383,21 @@ public final class WalkTapeView extends View {
 
     public MachineConditionProfile getConditionProfile() {
         return conditionProfile;
+    }
+
+    public void setRecordLevel(RecordLevelProfile requested) {
+        RecordLevelProfile selected = requested == null
+                ? RecordLevelProfile.standard()
+                : RecordLevelProfile.forId(requested.id);
+        if (selected.id.equals(recordLevel.id)) {
+            return;
+        }
+        recordLevel = selected;
+        invalidate();
+    }
+
+    public RecordLevelProfile getRecordLevel() {
+        return recordLevel;
     }
 
     public void setHighTape(boolean enabled) {
@@ -806,6 +846,9 @@ public final class WalkTapeView extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+        // Read once per frame rather than inside every one of the many dp() conversions a frame
+        // performs; it still tracks a configuration change on the very next frame.
+        density = getResources().getDisplayMetrics().density;
         long now = SystemClock.uptimeMillis();
         float dt = Math.min(0.05f, Math.max(0.001f, (now - lastFrameMs) / 1000f));
         lastFrameMs = now;
@@ -3503,10 +3546,11 @@ public final class WalkTapeView extends View {
                 settingsTarget = 0f;
                 break;
             case ACTION_SETTINGS_SECTION:
-                settingsSection = Math.max(0, Math.min(2, target.index));
+                settingsSection = Math.max(0, Math.min(3, target.index));
                 announceForAccessibility(settingsSection == 0
                         ? "磁带机列表" : settingsSection == 1
-                        ? "磁带配方列表" : "机器不完美感列表");
+                        ? "磁带配方列表" : settingsSection == 2
+                        ? "录音电平列表" : "机器不完美感列表");
                 invalidate();
                 break;
             case ACTION_MACHINE_PROFILE:
@@ -3548,6 +3592,21 @@ public final class WalkTapeView extends View {
                     }
                     announceForAccessibility("已装入 " + selectedTape.manufacturer
                             + " " + selectedTape.model + " " + selectedTape.typeShortLabel());
+                }
+                break;
+            case ACTION_RECORD_LEVEL:
+                List<RecordLevelProfile> levels = RecordLevelProfile.availableProfiles();
+                if (target.index >= 0 && target.index < levels.size()) {
+                    RecordLevelProfile selectedLevel = levels.get(target.index);
+                    boolean levelChanged = !selectedLevel.id.equals(recordLevel.id);
+                    setRecordLevel(selectedLevel);
+                    settingsTarget = 0f;
+                    if (levelChanged && listener != null) {
+                        listener.onRecordLevelChanged(selectedLevel);
+                    }
+                    announceForAccessibility("录音电平已设为 " + selectedLevel.name
+                            + "，峰值 " + Math.round(selectedLevel.peakOverReferenceDb)
+                            + " 分贝");
                 }
                 break;
             case ACTION_CONDITION_PROFILE:
@@ -3995,7 +4054,7 @@ public final class WalkTapeView extends View {
         drawText(canvas, "SIGNAL CHAIN", contentLeft, y, dp(8.2f), INK,
                 labelFace, Paint.Align.LEFT, 1.55f);
         y += dp(13);
-        drawText(canvas, "MACHINE  ×  MAGNETIC STOCK  ×  UNIT", contentLeft, y,
+        drawText(canvas, "MACHINE  ×  STOCK  ×  REC LEVEL  ×  UNIT", contentLeft, y,
                 dp(4.9f), MUTED_INK, labelFace, Paint.Align.LEFT, 1.05f);
 
         RectF close = new RectF(panel.right - dp(45), panel.top + dp(9),
@@ -4004,19 +4063,23 @@ public final class WalkTapeView extends View {
         addHit(ACTION_SETTINGS_CLOSE, close, -1);
 
         y += dp(14);
-        float tabGap = dp(4);
-        float tabWidth = (contentRight - contentLeft - tabGap * 2f) / 3f;
+        float tabGap = dp(3);
+        float tabWidth = (contentRight - contentLeft - tabGap * 3f) / 4f;
         RectF machineTab = new RectF(contentLeft, y, contentLeft + tabWidth, y + dp(22));
         RectF tapeTab = new RectF(machineTab.right + tabGap, y,
                 machineTab.right + tabGap + tabWidth, y + dp(22));
-        RectF conditionTab = new RectF(tapeTab.right + tabGap, y,
+        RectF levelTab = new RectF(tapeTab.right + tabGap, y,
+                tapeTab.right + tabGap + tabWidth, y + dp(22));
+        RectF conditionTab = new RectF(levelTab.right + tabGap, y,
                 contentRight, y + dp(22));
         drawSettingsTab(canvas, machineTab, "MACHINE", settingsSection == 0);
-        drawSettingsTab(canvas, tapeTab, "TAPE STOCK", settingsSection == 1);
-        drawSettingsTab(canvas, conditionTab, "CONDITION", settingsSection == 2);
+        drawSettingsTab(canvas, tapeTab, "STOCK", settingsSection == 1);
+        drawSettingsTab(canvas, levelTab, "REC LEVEL", settingsSection == 2);
+        drawSettingsTab(canvas, conditionTab, "CONDITION", settingsSection == 3);
         addHit(ACTION_SETTINGS_SECTION, machineTab, 0);
         addHit(ACTION_SETTINGS_SECTION, tapeTab, 1);
-        addHit(ACTION_SETTINGS_SECTION, conditionTab, 2);
+        addHit(ACTION_SETTINGS_SECTION, levelTab, 2);
+        addHit(ACTION_SETTINGS_SECTION, conditionTab, 3);
         y = machineTab.bottom + dp(8);
 
         if (settingsSection == 0) {
@@ -4024,6 +4087,9 @@ public final class WalkTapeView extends View {
                     panel.bottom - dp(31));
         } else if (settingsSection == 1) {
             drawTapeProfileCards(canvas, contentLeft, contentRight, y,
+                    panel.bottom - dp(31));
+        } else if (settingsSection == 2) {
+            drawRecordLevelCards(canvas, contentLeft, contentRight, y,
                     panel.bottom - dp(31));
         } else {
             drawConditionProfileCards(canvas, contentLeft, contentRight, y,
@@ -4041,13 +4107,15 @@ public final class WalkTapeView extends View {
                     : "MACHINE PATH · TONE / OUTPUT STAGE";
         } else if (settingsSection == 1) {
             settingsFooter = "TAPE PATH · EQ / MOL / SOL / PARTICLE NOISE";
+        } else if (settingsSection == 2) {
+            settingsFooter = "RECORD GAIN · HEADROOM TRADED FOR NOISE";
         } else {
             settingsFooter = "TOLERANCE ONLY · NO DROPOUT / CRACKLE / DAMAGE";
         }
         drawText(canvas, settingsFooter,
                 contentLeft, panel.bottom - dp(23), dp(4.05f), 0xff8a8273,
                 labelFace, Paint.Align.LEFT, 0.78f);
-        drawText(canvas, settingsSection == 2
+        drawText(canvas, settingsSection == 3
                         ? "HEALTHY UNITS · CONTINUOUS, BOUNDED VARIATION"
                         : "LIVE SWITCH · REBUILDS FROM THE CURRENT PLAYHEAD",
                 contentLeft, panel.bottom - dp(12), dp(4.1f), 0xff6f6b62,
@@ -4165,6 +4233,43 @@ public final class WalkTapeView extends View {
                     cardRight - cardLeft, dp(4.0f), 0xff706c64,
                     condensedFace, Paint.Align.LEFT);
             addHit(ACTION_TAPE_PROFILE, card, index);
+            y = card.bottom + gap;
+        }
+    }
+
+    /**
+     * Record level cards, laid out more tightly than the others because there are four of them.
+     */
+    private void drawRecordLevelCards(Canvas canvas,
+                                      float contentLeft,
+                                      float contentRight,
+                                      float top,
+                                      float bottom) {
+        List<RecordLevelProfile> levels = RecordLevelProfile.availableProfiles();
+        float gap = dp(5);
+        float cardHeight = (bottom - top - gap * (levels.size() - 1)) / levels.size();
+        float y = top;
+        for (int index = 0; index < levels.size(); index++) {
+            RecordLevelProfile candidate = levels.get(index);
+            boolean selected = candidate.id.equals(recordLevel.id);
+            int accent = candidate.accentColor;
+            RectF card = new RectF(contentLeft, y, contentRight, y + cardHeight);
+            drawSettingsCardFrame(canvas, card, selected, accent);
+
+            float cardLeft = card.left + dp(12);
+            float cardRight = card.right - dp(12);
+            drawText(canvas, candidate.levelLabel, cardLeft, card.top + dp(11),
+                    dp(4.5f), selected ? accent : MUTED_INK,
+                    labelFace, Paint.Align.LEFT, 1.0f);
+            drawText(canvas, candidate.compactSpec(), cardRight, card.top + dp(11),
+                    dp(4.0f), selected ? accent : 0xff78736a,
+                    condensedFace, Paint.Align.RIGHT, 0.6f);
+            drawText(canvas, candidate.name, cardLeft, card.top + dp(25),
+                    dp(9.4f), INK, displayFace, Paint.Align.LEFT, 0.42f);
+            drawEllipsizedText(canvas, candidate.character, cardLeft, card.top + dp(37),
+                    cardRight - cardLeft, dp(4.15f), 0xffa49c8c,
+                    labelFace, Paint.Align.LEFT);
+            addHit(ACTION_RECORD_LEVEL, card, index);
             y = card.bottom + gap;
         }
     }
@@ -4296,7 +4401,8 @@ public final class WalkTapeView extends View {
             }
             int start = 0;
             while (start < paragraph.length() && lines < maxLines) {
-                int count = paint.breakText(paragraph, start, paragraph.length(), true, maxWidth, null);
+                int count = textPaint.breakText(paragraph, start, paragraph.length(),
+                        true, maxWidth, null);
                 if (count <= 0) {
                     break;
                 }
@@ -4307,7 +4413,7 @@ public final class WalkTapeView extends View {
                         end = space;
                     }
                 }
-                canvas.drawText(paragraph, start, end, x, y, paint);
+                canvas.drawText(paragraph, start, end, x, y, textPaint);
                 y += lineHeight;
                 lines++;
                 start = end;
@@ -4329,7 +4435,7 @@ public final class WalkTapeView extends View {
                           Paint.Align align,
                           float letterSpacing) {
         configureText(size, color, typeface, align, letterSpacing);
-        canvas.drawText(text == null ? "" : text, x, baseline, paint);
+        canvas.drawText(text == null ? "" : text, x, baseline, textPaint);
     }
 
     private void drawEllipsizedText(Canvas canvas,
@@ -4343,11 +4449,14 @@ public final class WalkTapeView extends View {
                                     Paint.Align align) {
         configureText(size, color, typeface, align, 0);
         String safe = text == null ? "" : text;
-        if (paint.measureText(safe) > maxWidth) {
-            safe = TextUtils.ellipsize(safe, new android.text.TextPaint(paint), maxWidth,
+        if (textPaint.measureText(safe) > maxWidth) {
+            // Reuse one TextPaint. Allocating a copy per label meant a native paint object was
+            // created and finalised for every line of the info panel, every frame.
+            ellipsisPaint.set(textPaint);
+            safe = TextUtils.ellipsize(safe, ellipsisPaint, maxWidth,
                     TextUtils.TruncateAt.END).toString();
         }
-        canvas.drawText(safe, x, baseline, paint);
+        canvas.drawText(safe, x, baseline, textPaint);
     }
 
     private void configureText(float size,
@@ -4355,13 +4464,30 @@ public final class WalkTapeView extends View {
                                android.graphics.Typeface typeface,
                                Paint.Align align,
                                float letterSpacing) {
-        paint.setShader(null);
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor(color);
-        paint.setTextSize(size);
-        paint.setTypeface(typeface);
-        paint.setTextAlign(align);
-        paint.setLetterSpacing(letterSpacing / 10f);
+        // Only cross into the native paint for values that actually changed. A player frame draws
+        // dozens of strings that mostly share a size, face and colour, so skipping the redundant
+        // setters keeps Skia's glyph strike valid instead of rebuilding it for every label.
+        if (textPaintSize != size) {
+            textPaintSize = size;
+            textPaint.setTextSize(size);
+        }
+        if (textPaintColor != color) {
+            textPaintColor = color;
+            textPaint.setColor(color);
+        }
+        if (textPaintFace != typeface) {
+            textPaintFace = typeface;
+            textPaint.setTypeface(typeface);
+        }
+        if (textPaintAlign != align) {
+            textPaintAlign = align;
+            textPaint.setTextAlign(align);
+        }
+        float spacing = letterSpacing / 10f;
+        if (textPaintLetterSpacing != spacing) {
+            textPaintLetterSpacing = spacing;
+            textPaint.setLetterSpacing(spacing);
+        }
     }
 
     private void addHit(String action, RectF rect, int index) {
@@ -4414,7 +4540,7 @@ public final class WalkTapeView extends View {
     }
 
     private float dp(float value) {
-        return value * getResources().getDisplayMetrics().density;
+        return value * density;
     }
 
     private static float approach(float value, float target, float amount) {

@@ -39,11 +39,26 @@ public final class PlaybackController {
     private static final int AUDIO_PRIME_MS = 450;
     private static final int TONE_CHANGE_PRIME_MS = 120;
     private static final int AUDIO_BUFFER_MS = 2_000;
-    private static final int PCM_QUEUE_MS = 2_000;
+    // The Java reserve is what absorbs a storage stall, a codec hiccup or a GC pause. Six seconds
+    // costs about 2.3 MB at 48 kHz and is the difference between riding out a slow FUSE read and
+    // emptying AudioTrack. It is deliberately much larger than the hardware buffer, which cannot
+    // be grown indefinitely on every device.
+    private static final int PCM_QUEUE_MS = 6_000;
     private static final int AUDIO_WRITE_FRAMES = 2_048;
     private static final long AUDIO_WRITER_JOIN_MS = 2_000L;
     private static final int ALAC_DECODE_WORKERS = 2;
     private static final int ALAC_PIPELINE_SLOTS = 12;
+    // Demuxed packets held ahead of the decoder. Compressed access units are small, so this is a
+    // cheap way to keep several hundred milliseconds of read-ahead in front of the codec.
+    private static final int PACKET_QUEUE_DEPTH = 32;
+    private static final int COMPRESSED_PACKET_BYTES = 16 * 1024;
+    private static final int RAW_PCM_PACKET_BYTES = 64 * 1024;
+    private static final int RAW_PCM_PACKET_QUEUE_DEPTH = 24;
+    private static final long PACKET_QUEUE_BUDGET_BYTES = 2L * 1024 * 1024;
+    private static final long PACKET_POLL_MS = 20L;
+    private static final long STARVATION_CHECK_MS = 400L;
+    private static final int STARVATION_REPRIME_MS = 900;
+    private static final long STARVATION_REPRIME_TIMEOUT_MS = 2_500L;
 
     public enum HotlineResult {
         STARTED,
@@ -79,6 +94,7 @@ public final class PlaybackController {
     private volatile TapeStockProfile tapeProfile = TapeStockProfile.sonyChf1978();
     private volatile MachineConditionProfile conditionProfile =
             MachineConditionProfile.calibrated();
+    private volatile RecordLevelProfile recordLevel = RecordLevelProfile.standard();
 
     public PlaybackController(Context context, Listener listener) {
         appContext = context.getApplicationContext();
@@ -114,6 +130,7 @@ public final class PlaybackController {
         next.setMachineProfile(machineProfile);
         next.setTapeProfile(tapeProfile);
         next.setConditionProfile(conditionProfile);
+        next.setRecordLevel(recordLevel);
         next.setHighTape(highTape);
         next.setDolbyMode(dolbyMode);
         session = next;
@@ -272,6 +289,22 @@ public final class PlaybackController {
         return conditionProfile;
     }
 
+    /** How hot the tape being played was recorded. */
+    public void setRecordLevel(RecordLevelProfile level) {
+        RecordLevelProfile selected = level == null
+                ? RecordLevelProfile.standard()
+                : RecordLevelProfile.forId(level.id);
+        recordLevel = selected;
+        DecoderSession active = session;
+        if (active != null) {
+            active.setRecordLevel(selected);
+        }
+    }
+
+    RecordLevelProfile getRecordLevelForTest() {
+        return recordLevel;
+    }
+
     public synchronized void release() {
         hotlineMonitor.stop();
         DecoderSession previous = session;
@@ -383,6 +416,9 @@ public final class PlaybackController {
         private volatile TapeStockProfile sessionTapeProfile = TapeStockProfile.sonyChf1978();
         private volatile MachineConditionProfile sessionConditionProfile =
                 MachineConditionProfile.calibrated();
+        private volatile RecordLevelProfile sessionRecordLevel = RecordLevelProfile.standard();
+        private volatile TapeTransportState sessionTransportState =
+                TapeTransportState.STARTING;
         private volatile AudioTrack audioTrack;
         private volatile PcmWriter pcmWriter;
         private volatile TapeMachineDsp dsp;
@@ -392,6 +428,8 @@ public final class PlaybackController {
         private volatile boolean outputStarted;
 
         private MediaExtractor extractor;
+        private MediaPacketSource packetSource;
+        private final PlaybackHealth health = new PlaybackHealth("tps-l2");
         private MediaCodec codec;
         private String sourceMime;
         private String decoderName;
@@ -410,6 +448,11 @@ public final class PlaybackController {
         private volatile int audioPrimeMs = AUDIO_PRIME_MS;
         private final AudioLevelTimeline audioLevels = new AudioLevelTimeline();
         private boolean preparedCallbackSent;
+        private int rendererLatencyFrames;
+        private int rendererLeadInFrames;
+        private boolean rendererTailFlushed;
+        private long renderedThroughUs;
+        private float[] rendererTailBuffer = new float[0];
         private float[] stereoBuffer = new float[0];
         private float[] resampledBuffer = new float[0];
         private short[] pcm16Buffer = new short[0];
@@ -486,6 +529,12 @@ public final class PlaybackController {
                     return false;
                 }
                 paused = !paused;
+                sessionTransportState = paused
+                        ? TapeTransportState.PAUSED : TapeTransportState.STARTING;
+                TapeMachineDsp renderer = dsp;
+                if (renderer != null) {
+                    renderer.setTransportState(sessionTransportState);
+                }
                 AudioTrack output = audioTrack;
                 if (output != null) {
                     try {
@@ -538,6 +587,13 @@ public final class PlaybackController {
         }
 
         void seekTo(long positionMs) {
+            long previousMs = getPositionMs();
+            sessionTransportState = positionMs < previousMs
+                    ? TapeTransportState.REWIND : TapeTransportState.FAST_FORWARD;
+            TapeMachineDsp renderer = dsp;
+            if (renderer != null) {
+                renderer.setTransportState(sessionTransportState);
+            }
             requestSeek(positionMs, AUDIO_PRIME_MS, false);
         }
 
@@ -550,6 +606,11 @@ public final class PlaybackController {
                 // the pending rebuild into a state-preserving seek.
                 pendingSeekPreservesDsp = alreadyPending
                         ? pendingSeekPreservesDsp && preserveDsp : preserveDsp;
+                if (preserveDsp) {
+                    // HIGH/LOW is an electrical selector, not a tape-wind command.
+                    sessionTransportState = paused
+                            ? TapeTransportState.PAUSED : TapeTransportState.PLAYING;
+                }
                 audioPrimeMs = Math.max(1, primeMs);
                 fallbackPositionMs = Math.max(0, positionMs);
                 playbackAnchorSet = false;
@@ -653,6 +714,23 @@ public final class PlaybackController {
             }
         }
 
+        void setRecordLevel(RecordLevelProfile level) {
+            RecordLevelProfile selected = level == null
+                    ? RecordLevelProfile.standard()
+                    : RecordLevelProfile.forId(level.id);
+            boolean changed = !selected.id.equals(sessionRecordLevel.id);
+            sessionRecordLevel = selected;
+            TapeMachineDsp active = dsp;
+            if (active != null) {
+                active.setRecordLevel(selected);
+            }
+            if (changed && prepared && !finished && !stopRequested) {
+                // Already-queued PCM carries the old level, so re-enter at the playhead rather
+                // than letting two record levels meet inside one buffer.
+                requestSeek(getPositionMs(), TONE_CHANGE_PRIME_MS, false);
+            }
+        }
+
         void setConditionProfile(MachineConditionProfile profile) {
             MachineConditionProfile selected = profile == null
                     ? MachineConditionProfile.calibrated()
@@ -668,6 +746,11 @@ public final class PlaybackController {
 
         void requestStop() {
             stopRequested = true;
+            sessionTransportState = TapeTransportState.STOPPED;
+            TapeMachineDsp renderer = dsp;
+            if (renderer != null) {
+                renderer.setTransportState(TapeTransportState.STOPPED);
+            }
             interrupt();
             PcmWriter writer = pcmWriter;
             if (writer != null) {
@@ -732,31 +815,60 @@ public final class PlaybackController {
             }
             configureOutput(sampleRate, channels, encoding);
 
-            ByteBuffer source = ByteBuffer.allocateDirect(256 * 1024).order(ByteOrder.nativeOrder());
+            packetSource = createPacketSource(format, RAW_PCM_PACKET_BYTES,
+                    RAW_PCM_PACKET_QUEUE_DEPTH);
             while (!stopRequested) {
                 waitWhilePaused();
                 long seekUs = consumeSeek();
                 if (seekUs != NO_SEEK) {
-                    extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                    packetSource.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
                     resetAfterSeek(seekUs);
                 }
                 if (stopRequested || paused) {
                     continue;
                 }
 
-                rejectEncryptedSample();
-                source.clear();
-                int size = extractor.readSampleData(source, 0);
-                if (size < 0) {
-                    if (waitForAudioDrain()) {
-                        return;
-                    }
+                long readStart = System.nanoTime();
+                MediaPacketSource.Packet packet = packetSource.poll(PACKET_POLL_MS);
+                health.addReadNanos(System.nanoTime() - readStart);
+                if (packet == null) {
                     continue;
                 }
-                long presentationUs = Math.max(0L, extractor.getSampleTime());
-                writePcm(source, 0, size, encoding, channels, presentationUs);
-                extractor.advance();
+                try {
+                    if (packet.endOfStream) {
+                        flushRendererTail();
+                        if (waitForAudioDrain()) {
+                            return;
+                        }
+                        continue;
+                    }
+                    if (packet.encrypted) {
+                        throw new PlaybackFailure("这首歌带有 DRM/加密，无法作为本地磁带渲染");
+                    }
+                    writePcm(packet.data, 0, packet.size, encoding, channels,
+                            packet.presentationUs);
+                } finally {
+                    packetSource.recycle(packet);
+                }
+                health.reportIfDue();
             }
+        }
+
+        /**
+         * Builds the read-ahead queue for this track.
+         *
+         * <p>Capacity follows the container's advertised maximum access unit so a packet can never
+         * overflow, while the depth is trimmed to keep the whole queue inside a fixed memory
+         * budget regardless of how large those access units are.</p>
+         */
+        private MediaPacketSource createPacketSource(MediaFormat format,
+                                                     int minimumCapacityBytes,
+                                                     int maximumDepth) {
+            int advertised = formatInt(format, MediaFormat.KEY_MAX_INPUT_SIZE, 0);
+            int capacity = Math.max(minimumCapacityBytes, advertised + 16);
+            int depth = (int) Math.max(4L,
+                    Math.min(maximumDepth, PACKET_QUEUE_BUDGET_BYTES / capacity));
+            return new MediaPacketSource(extractor, capacity, depth);
         }
 
         private void decodeAlac(MediaFormat sourceFormat) throws Exception {
@@ -771,7 +883,10 @@ public final class PlaybackController {
 
             int advertisedPacketBytes = formatInt(
                     sourceFormat, MediaFormat.KEY_MAX_INPUT_SIZE, 0) + 16;
-            int inputCapacity = Math.max(256 * 1024, advertisedPacketBytes);
+            // The read-ahead queue is sized from the container's advertised maximum, so a modest
+            // floor keeps a useful number of ALAC packets resident instead of a couple of huge,
+            // mostly empty buffers.
+            int inputCapacity = Math.max(64 * 1024, advertisedPacketBytes);
             int queuedPacketCapacity = Math.max(32 * 1024, advertisedPacketBytes);
             ParallelAlacFrameDecoder decoder;
             try {
@@ -789,7 +904,7 @@ public final class PlaybackController {
                     ? AudioFormat.ENCODING_PCM_16BIT : PCM_24_BIT_PACKED;
             configureOutput(sampleRate, channels, encoding);
 
-            ByteBuffer source = ByteBuffer.allocateDirect(inputCapacity);
+            packetSource = createPacketSource(sourceFormat, inputCapacity, PACKET_QUEUE_DEPTH);
             ArrayDeque<ParallelAlacFrameDecoder.Frame> pending = new ArrayDeque<>(
                     ALAC_PIPELINE_SLOTS);
             boolean inputEnded = false;
@@ -803,7 +918,7 @@ public final class PlaybackController {
                         // before repositioning so a scrub/profile change cannot leak stale PCM.
                         decoder.close();
                         pending.clear();
-                        extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                        packetSource.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
                         resetAfterSeek(seekUs);
                         decoder = new ParallelAlacFrameDecoder(config, ALAC_DECODE_WORKERS,
                                 ALAC_PIPELINE_SLOTS, queuedPacketCapacity);
@@ -815,31 +930,47 @@ public final class PlaybackController {
 
                     // ALAC packets are independent. Keep a fixed look-ahead window full while two
                     // decoder instances process consecutive frames on separate cores. Consumption
-                    // remains strictly in MediaExtractor order, so PCM and timestamps are stable.
+                    // remains strictly in packet order, so PCM and timestamps are stable.
                     while (!inputEnded && pending.size() < decoder.getSlotCount()
                             && !stopRequested && !paused && !hasPendingSeek()) {
-                        rejectEncryptedSample();
-                        source.clear();
-                        int packetSize = extractor.readSampleData(source, 0);
-                        if (packetSize < 0) {
-                            inputEnded = true;
+                        // Only wait when there is no decoded frame left to consume. Otherwise the
+                        // loop would spin on an empty queue during a storage stall, burning a core
+                        // that the renderer needs.
+                        long readStart = System.nanoTime();
+                        MediaPacketSource.Packet packet = packetSource.poll(
+                                pending.isEmpty() ? PACKET_POLL_MS : 0L);
+                        health.addReadNanos(System.nanoTime() - readStart);
+                        if (packet == null) {
                             break;
                         }
-                        if (packetSize > source.capacity()) {
-                            throw new PlaybackFailure("ALAC 压缩帧超过了解码缓冲区");
+                        try {
+                            if (packet.endOfStream) {
+                                inputEnded = true;
+                                break;
+                            }
+                            if (packet.encrypted) {
+                                throw new PlaybackFailure(
+                                        "这首歌带有 DRM/加密，无法作为本地磁带渲染");
+                            }
+                            if (packet.size > packetSource.packetCapacity()) {
+                                throw new PlaybackFailure("ALAC 压缩帧超过了解码缓冲区");
+                            }
+                            packet.data.position(0);
+                            packet.data.limit(packet.size);
+                            pending.addLast(decoder.submit(packet.data, packet.size,
+                                    packet.presentationUs));
+                        } finally {
+                            packetSource.recycle(packet);
                         }
-                        long presentationUs = Math.max(0L, extractor.getSampleTime());
-                        source.position(0);
-                        source.limit(packetSize);
-                        pending.addLast(decoder.submit(source, packetSize, presentationUs));
-                        extractor.advance();
                     }
+                    health.reportIfDue();
 
                     if (hasPendingSeek()) {
                         continue;
                     }
                     if (pending.isEmpty()) {
                         if (inputEnded) {
+                            flushRendererTail();
                             if (waitForAudioDrain()) {
                                 return;
                             }
@@ -880,11 +1011,18 @@ public final class PlaybackController {
         private void decodeCompressed(MediaFormat sourceFormat) throws Exception {
             startDecoderWithBestPcm(sourceFormat);
 
+            packetSource = createPacketSource(sourceFormat, COMPRESSED_PACKET_BYTES,
+                    PACKET_QUEUE_DEPTH);
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             boolean inputEnded = false;
             boolean outputEnded = false;
+            // A packet already taken from the reader is kept here when the codec has no free input
+            // buffer, so read-ahead is never thrown away just because the decoder is momentarily
+            // busy.
+            MediaPacketSource.Packet pendingPacket = null;
             while (!stopRequested) {
                 if (outputEnded) {
+                    flushRendererTail();
                     if (waitForAudioDrain()) {
                         return;
                     }
@@ -892,7 +1030,9 @@ public final class PlaybackController {
                 waitWhilePaused();
                 long seekUs = consumeSeek();
                 if (seekUs != NO_SEEK) {
-                    extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                    packetSource.recycle(pendingPacket);
+                    pendingPacket = null;
+                    packetSource.seekTo(seekUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
                     codec.flush();
                     inputEnded = false;
                     outputEnded = false;
@@ -903,27 +1043,48 @@ public final class PlaybackController {
                 }
 
                 if (!inputEnded) {
-                    int inputIndex = codec.dequeueInputBuffer(CODEC_TIMEOUT_US);
-                    if (inputIndex >= 0) {
-                        ByteBuffer input = codec.getInputBuffer(inputIndex);
-                        if (input == null) {
-                            throw new PlaybackFailure("解码器没有提供输入缓冲区");
-                        }
-                        input.clear();
-                        rejectEncryptedSample();
-                        int sampleSize = extractor.readSampleData(input, 0);
-                        if (sampleSize < 0) {
-                            codec.queueInputBuffer(inputIndex, 0, 0, 0,
-                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM);
-                            inputEnded = true;
-                        } else {
-                            long presentationUs = Math.max(0L, extractor.getSampleTime());
-                            codec.queueInputBuffer(inputIndex, 0, sampleSize, presentationUs, 0);
-                            extractor.advance();
+                    if (pendingPacket == null) {
+                        // Non-blocking: the codec's own output timeout below paces this loop, and
+                        // an empty queue here is exactly the storage stall the reader absorbs.
+                        long readStart = System.nanoTime();
+                        pendingPacket = packetSource.poll(0L);
+                        health.addReadNanos(System.nanoTime() - readStart);
+                    }
+                    if (pendingPacket != null && pendingPacket.encrypted) {
+                        throw new PlaybackFailure("这首歌带有 DRM/加密，无法作为本地磁带渲染");
+                    }
+                    if (pendingPacket != null) {
+                        int inputIndex = codec.dequeueInputBuffer(CODEC_TIMEOUT_US);
+                        if (inputIndex >= 0) {
+                            if (pendingPacket.endOfStream) {
+                                codec.queueInputBuffer(inputIndex, 0, 0, 0,
+                                        MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                                inputEnded = true;
+                                pendingPacket = null;
+                            } else {
+                                ByteBuffer input = codec.getInputBuffer(inputIndex);
+                                if (input == null) {
+                                    throw new PlaybackFailure("解码器没有提供输入缓冲区");
+                                }
+                                input.clear();
+                                if (input.remaining() < pendingPacket.size) {
+                                    throw new PlaybackFailure(
+                                            "解码器输入缓冲区容纳不下压缩帧："
+                                                    + pendingPacket.size + " 字节");
+                                }
+                                pendingPacket.data.position(0);
+                                pendingPacket.data.limit(pendingPacket.size);
+                                input.put(pendingPacket.data);
+                                codec.queueInputBuffer(inputIndex, 0, pendingPacket.size,
+                                        pendingPacket.presentationUs, 0);
+                                packetSource.recycle(pendingPacket);
+                                pendingPacket = null;
+                            }
                         }
                     }
                 }
 
+                health.reportIfDue();
                 int outputIndex = codec.dequeueOutputBuffer(info, CODEC_TIMEOUT_US);
                 if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     MediaFormat outputFormat = codec.getOutputFormat();
@@ -1048,6 +1209,7 @@ public final class PlaybackController {
             }
 
             setOutputStartThreshold(output, renderSampleRate, AUDIO_PRIME_MS);
+            health.setSampleRate(renderSampleRate);
             inputSampleRate = sampleRate;
             outputSampleRate = renderSampleRate;
             outputChannels = channels;
@@ -1059,7 +1221,13 @@ public final class PlaybackController {
                     renderSampleRate);
             renderer.setHighTape(sessionHighTape);
             renderer.setDolbyMode(sessionDolbyMode);
+            renderer.setRecordLevel(sessionRecordLevel);
+            renderer.setTapePosition(durationMs <= 0 ? 0.5f
+                    : Math.max(0f, Math.min(1f, fallbackPositionMs / (float) durationMs)));
+            renderer.setTransportState(paused
+                    ? TapeTransportState.PAUSED : sessionTransportState);
             dsp = renderer;
+            resetRendererLatency(renderer);
             dspProfileId = sessionProfile.id;
             dspTapeProfileId = sessionTapeProfile.id;
             dspConditionProfileId = sessionConditionProfile.id;
@@ -1339,10 +1507,44 @@ public final class PlaybackController {
             if (hasPendingSeek()) {
                 return;
             }
+            renderer.setTapePosition(durationMs <= 0 ? 0.5f
+                    : Math.max(0f, Math.min(1f,
+                    (firstAudibleUs / 1_000f) / durationMs)));
+            long renderStart = System.nanoTime();
             renderer.process(renderBuffer, renderFrames);
+            health.addRenderNanos(System.nanoTime() - renderStart, renderFrames);
+            if (sessionTransportState == TapeTransportState.STARTING) {
+                sessionTransportState = TapeTransportState.PLAYING;
+                renderer.setTransportState(TapeTransportState.PLAYING);
+            }
             if (hasPendingSeek()) {
                 return;
             }
+
+            // Where the source material fed into this block ends. The end-of-tape flush continues
+            // the input timeline from here, so its frames land immediately after the last real one.
+            renderedThroughUs = outputSampleRate <= 0 ? firstAudibleUs
+                    : firstAudibleUs + (long) renderFrames * 1_000_000L / outputSampleRate;
+
+            // A renderer that models print-through pre-echo has to see one pack revolution ahead,
+            // so its first frames after a reset describe tape that comes before the seek point.
+            // Discarding exactly that many frames puts the output back on the source timeline.
+            int leadIn = 0;
+            if (rendererLeadInFrames > 0) {
+                leadIn = Math.min(rendererLeadInFrames, renderFrames);
+                rendererLeadInFrames -= leadIn;
+                health.setLeadInRemaining(rendererLeadInFrames);
+                renderFrames -= leadIn;
+                if (renderFrames <= 0) {
+                    return;
+                }
+                System.arraycopy(renderBuffer, leadIn * 2, renderBuffer, 0, renderFrames * 2);
+                requiredSamples = renderFrames * 2;
+            }
+            long latencyOffsetUs = outputSampleRate <= 0 ? 0L
+                    : (long) (leadIn - rendererLatencyFrames) * 1_000_000L / outputSampleRate;
+            firstAudibleUs = Math.max(0L, firstAudibleUs + latencyOffsetUs);
+
             if (writeStereoFloat(renderBuffer, requiredSamples, firstAudibleUs)) {
                 synchronized (controlLock) {
                     // If a seek/profile rebuild lands after enqueue, requestSeek() either waits
@@ -1382,6 +1584,53 @@ public final class PlaybackController {
             }
             fallbackPositionMs = Math.max(0, presentationUs / 1_000L);
             return true;
+        }
+
+        /**
+         * Notes that the renderer has been reset and will need its look-ahead refilled.
+         *
+         * <p>Called from every path that resets or rebuilds the machine, so the lead-in discard and
+         * the end-of-tape flush always agree with the renderer that is actually installed.</p>
+         */
+        private void resetRendererLatency(TapeMachineDsp renderer) {
+            rendererLatencyFrames = renderer == null ? 0 : Math.max(0, renderer.latencyFrames());
+            rendererLeadInFrames = rendererLatencyFrames;
+            rendererTailFlushed = false;
+            health.armLookAhead(rendererLatencyFrames, rendererLeadInFrames);
+        }
+
+        /**
+         * Runs the tape past the end of the programme so the look-ahead stage empties.
+         *
+         * <p>Without this the final revolution of every track would still be inside the
+         * print-through delay line when decoding stops, and the last seconds of music would never
+         * be heard. On a real machine the tape simply keeps moving, which is why the flush is fed
+         * with silence and produces the run-out shadow of the closing passage.</p>
+         */
+        private void flushRendererTail() throws Exception {
+            if (rendererTailFlushed) {
+                return;
+            }
+            rendererTailFlushed = true;
+            // Always a whole look-ahead, never the outstanding remainder: a track shorter than one
+            // revolution has not emitted anything yet, and only a full flush pushes all of it out.
+            int remaining = rendererLatencyFrames;
+            TapeMachineDsp renderer = dsp;
+            if (remaining <= 0 || renderer == null || outputSampleRate <= 0) {
+                return;
+            }
+            int blockFrames = Math.min(remaining, AUDIO_WRITE_FRAMES);
+            if (rendererTailBuffer.length < blockFrames * 2) {
+                rendererTailBuffer = new float[blockFrames * 2];
+            }
+            long presentationUs = renderedThroughUs;
+            while (remaining > 0 && !stopRequested && !hasPendingSeek()) {
+                int frames = Math.min(blockFrames, remaining);
+                Arrays.fill(rendererTailBuffer, 0, frames * 2, 0f);
+                renderTapePcm(rendererTailBuffer, frames, presentationUs);
+                presentationUs += (long) frames * 1_000_000L / outputSampleRate;
+                remaining -= frames;
+            }
         }
 
         /** @return true after drain, false when a seek should restart decoding. */
@@ -1471,13 +1720,27 @@ public final class PlaybackController {
                 consumedSeekPreservesDsp = false;
             }
             if (renderer != null) {
-                if (!consumedSeekPreservesDsp) {
-                    renderer.reset();
-                }
                 renderer.setHighTape(sessionHighTape);
                 renderer.setDolbyMode(sessionDolbyMode);
+                renderer.setRecordLevel(sessionRecordLevel);
+                renderer.setTapePosition(durationMs <= 0 ? 0.5f
+                        : Math.max(0f, Math.min(1f,
+                        (seekUs / 1_000f) / durationMs)));
+                if (!consumedSeekPreservesDsp) {
+                    // Publish the physical command before reset so the renderer initialises its
+                    // power/current state consistently instead of resetting as PLAY first.
+                    sessionTransportState = paused
+                            ? TapeTransportState.PAUSED : TapeTransportState.STARTING;
+                    renderer.setTransportState(sessionTransportState);
+                    renderer.reset();
+                }
+                renderer.setTransportState(sessionTransportState);
+                // Even a state-preserving tone switch restarts the audible timeline here, so the
+                // look-ahead accounting is refreshed either way.
+                resetRendererLatency(renderer);
             }
             consumedSeekPreservesDsp = false;
+            renderedThroughUs = seekUs;
             PcmRateConverter converter = rateConverter;
             if (converter != null) {
                 converter.reset();
@@ -1517,6 +1780,9 @@ public final class PlaybackController {
             private long anchorUs;
             private volatile boolean stopped;
             private PlaybackFailure failure;
+            private final int repriveSamples;
+            private int lastUnderrunCount;
+            private long lastStarvationCheckMs;
 
             PcmWriter(AudioTrack output, int sampleRate) {
                 super("WalkTape audio writer");
@@ -1524,6 +1790,85 @@ public final class PlaybackController {
                 int queueSamples = Math.max(writeBuffer.length * 4,
                         sampleRate * 2 * PCM_QUEUE_MS / 1_000);
                 ring = new float[queueSamples & ~1];
+                repriveSamples = Math.min(ring.length / 2,
+                        sampleRate * 2 * STARVATION_REPRIME_MS / 1_000);
+            }
+
+            /**
+             * Turns a drained hardware buffer back into a single short gap.
+             *
+             * <p>Once AudioTrack has run dry, continuing to hand it whatever little PCM exists
+             * produces a continuous stutter that never ends, because nothing in the pipeline ever
+             * rebuilds the reserve. Pausing the track instead lets the producer get ahead again,
+             * after which playback resumes cleanly from where it stopped. The wait is bounded, so
+             * a genuinely overloaded device is no worse off than before.</p>
+             */
+            private void repriveIfStarved() throws InterruptedException {
+                if (stopped || stopRequested || paused || !outputStarted) {
+                    return;
+                }
+                long now = System.currentTimeMillis();
+                if (now - lastStarvationCheckMs < STARVATION_CHECK_MS) {
+                    return;
+                }
+                lastStarvationCheckMs = now;
+                if (hasPendingSeek()) {
+                    return;
+                }
+                health.updateUnderruns(output);
+                int underrunNow = currentUnderrunCount();
+                boolean starved = underrunNow > lastUnderrunCount;
+                lastUnderrunCount = underrunNow;
+                if (!starved) {
+                    return;
+                }
+                synchronized (queueLock) {
+                    if (queuedSamples >= repriveSamples) {
+                        // The reserve recovered without help; nothing to do.
+                        return;
+                    }
+                }
+                try {
+                    output.pause();
+                } catch (IllegalStateException unusable) {
+                    return;
+                }
+                health.recordRecovery();
+                long deadline = System.currentTimeMillis() + STARVATION_REPRIME_TIMEOUT_MS;
+                synchronized (queueLock) {
+                    int expectedGeneration = generation;
+                    while (queuedSamples < repriveSamples && !stopped && !stopRequested
+                            && expectedGeneration == generation) {
+                        long remaining = deadline - System.currentTimeMillis();
+                        if (remaining <= 0L) {
+                            break;
+                        }
+                        queueLock.wait(remaining);
+                    }
+                }
+                if (stopped || stopRequested || hasPendingSeek()) {
+                    return;
+                }
+                synchronized (controlLock) {
+                    if (!paused && pendingSeekUs == NO_SEEK && !stopRequested) {
+                        try {
+                            output.play();
+                        } catch (IllegalStateException ignored) {
+                            // The decoder thread reports a real output failure on the next write.
+                        }
+                    }
+                }
+            }
+
+            private int currentUnderrunCount() {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+                    return lastUnderrunCount;
+                }
+                try {
+                    return output.getUnderrunCount();
+                } catch (IllegalStateException unusable) {
+                    return lastUnderrunCount;
+                }
             }
 
             boolean enqueue(float[] source, int requestedSamples, long presentationUs)
@@ -1542,7 +1887,12 @@ public final class PlaybackController {
                         while (queuedSamples == ring.length
                                 && expectedGeneration == generation
                                 && !stopped && !stopRequested) {
+                            // Waiting here means the reserve is full, which is the healthy state.
+                            // It is recorded so a report showing no idle time immediately
+                            // identifies a producer that can no longer keep up.
+                            long waitStart = System.nanoTime();
                             queueLock.wait();
+                            health.addQueueWaitNanos(System.nanoTime() - waitStart);
                             throwIfFailedLocked();
                         }
                         if (stopped || stopRequested || expectedGeneration != generation) {
@@ -1564,6 +1914,7 @@ public final class PlaybackController {
                         queuedSamples += amount;
                         queueLock.notifyAll();
                     }
+                    health.setReserve((queuedSamples + inFlightSamples) / 2, ring.length / 2);
                 }
                 return true;
             }
@@ -1634,6 +1985,7 @@ public final class PlaybackController {
                 try {
                     Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
                     while (!stopped && !stopRequested) {
+                        repriveIfStarved();
                         int samples;
                         int blockGeneration;
                         boolean ownsAnchor;
@@ -1719,8 +2071,10 @@ public final class PlaybackController {
                         ownsAnchor = false;
                     }
 
+                    long writeStart = System.nanoTime();
                     int result = output.write(writeBuffer, written, sampleCount - written,
                             AudioTrack.WRITE_BLOCKING);
+                    health.addWriteBlockedNanos(System.nanoTime() - writeStart);
                     if (result < 0) {
                         if (stopped || stopRequested || blockGeneration != generation
                                 || hasPendingSeek()) {
@@ -1792,6 +2146,11 @@ public final class PlaybackController {
 
         private void releaseDecoderResources() {
             audioLevels.clear();
+            // The reader thread owns the extractor, so it must be stopped before release().
+            if (packetSource != null) {
+                packetSource.close();
+                packetSource = null;
+            }
             if (codec != null) {
                 try {
                     codec.stop();

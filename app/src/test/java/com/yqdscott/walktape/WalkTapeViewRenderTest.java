@@ -116,6 +116,30 @@ public class WalkTapeViewRenderTest {
     }
 
     @Test
+    public void signalChainRecordLevelTabSelectsHowHardTheTapeWasRecorded() throws IOException {
+        MachineListener listener = new MachineListener();
+        view.setListener(listener);
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+
+        tap(624, 93);
+        settleAndRender(1080, 2160);
+        tap(652, 790); // REC LEVEL tab, third of the four signal-chain tabs
+        Bitmap levelSelector = settleAndRender(1080, 2160);
+        save(levelSelector, "18-record-level-selector.png");
+
+        assertEquals(RecordLevelProfile.STANDARD, view.getRecordLevel().id);
+        tap(520, 1_290); // HOT card, third of four
+        settleAndRender(1080, 2160);
+
+        assertEquals(RecordLevelProfile.HOT, view.getRecordLevel().id);
+        assertEquals(1, listener.recordLevelChanges);
+        assertEquals(RecordLevelProfile.HOT, listener.lastRecordLevel.id);
+        assertTrue(new File(outputDirectory(),
+                "18-record-level-selector.png").length() > 40_000);
+    }
+
+    @Test
     public void machineRoomSelectsAndRendersTheAiwaProfile() throws IOException {
         MachineListener listener = new MachineListener();
         view.setListener(listener);
@@ -252,7 +276,7 @@ public class WalkTapeViewRenderTest {
 
         tap(624, 93);
         settleAndRender(1080, 2160);
-        tap(540, 790); // TAPE STOCK tab
+        tap(428, 790); // STOCK tab, second of the four signal-chain tabs
         Bitmap tapeSelector = settleAndRender(1080, 2160);
         save(tapeSelector, "12-tape-stock-selector.png");
         tap(520, 1_155); // TDK SA Type II card
@@ -809,10 +833,12 @@ public class WalkTapeViewRenderTest {
         int profileChanges;
         int tapeProfileChanges;
         int conditionProfileChanges;
+        int recordLevelChanges;
         int hotlineChanges;
         TapeMachineProfile lastProfile;
         TapeStockProfile lastTapeProfile;
         MachineConditionProfile lastConditionProfile;
+        RecordLevelProfile lastRecordLevel;
 
         @Override public void onImportRequested() { }
         @Override public void onTrackSelected(CatalogModels.Album album, CatalogModels.Track track) { }
@@ -824,6 +850,10 @@ public class WalkTapeViewRenderTest {
         @Override public void onExitPlayer() { }
         @Override public void onHotlineChanged(boolean active) { hotlineChanges++; }
         @Override public void onToneChanged(boolean highTape) { }
+        @Override public void onRecordLevelChanged(RecordLevelProfile level) {
+            recordLevelChanges++;
+            lastRecordLevel = level;
+        }
         @Override public void onMachineProfileChanged(TapeMachineProfile profile) {
             profileChanges++;
             lastProfile = profile;

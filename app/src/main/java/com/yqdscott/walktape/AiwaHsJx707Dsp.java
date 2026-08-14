@@ -5,13 +5,26 @@ import java.util.Arrays;
 /**
  * Realtime machine-only reference model of a serviced Aiwa HS-JX707 with BBE and DSL disabled.
  *
- * <p>No trustworthy per-frequency sweep of a correctly aligned JX707 is publicly available.
- * This renderer therefore models the audio path against Aiwa's 1992 service limits: the manual
- * tape selector changes the 120 us Normal and 70 us Cr/Metal paths, the usable bands end at
+ * <p>No trustworthy per-frequency sweep of a correctly aligned JX707 is publicly available, so
+ * most of this renderer is modelled against Aiwa's 1992 service limits: the usable bands end at
  * 8 kHz and 12.5 kHz respectively, steady transport remains below the published 0.45% RMS
  * service ceiling, and unassisted playback exceeds the specified 45 dB signal-to-noise ratio.
  * The 0.320% RMS transport target is a conservative serviced-unit value inside that envelope,
  * not a claim that every surviving machine measures identically.</p>
+ *
+ * <p>The <em>replay equalisation</em> is no longer part of that envelope-fitting. It is solved
+ * from Aiwa's own component values by {@link AiwaHsJx707ReplayEq}, whose netlist was read off the
+ * service manual schematic and validated against the IEC characteristic to 1.2 dB on Normal and
+ * 1.9 dB on Cr/Metal from 63 Hz to 16 kHz. The record pre-emphasis and its exact inverse either
+ * side of the tape stage carry the standard curve, so what {@code ReplayErrorEq} adds is only this
+ * machine's departure from a perfect deck: a slight presence lift, a tape-type-dependent treble
+ * tilt, and a bass turnover set by C19 and R17 that reaches -4.5 dB at 20 Hz. A spec-derived 63 Hz
+ * Butterworth high-pass used to stand in for that turnover and has been removed, because keeping
+ * both would count the same rolloff twice.</p>
+ *
+ * <p>What the schematic cannot supply stays an explicit prior. The head's long-wavelength contour
+ * and the 8 kHz / 12.5 kHz endpoints are head and tape losses, not amplifier behaviour, so they
+ * remain spec-derived and are marked as such where they are built.</p>
  *
  * <p>Production playback supplies magnetic non-linearity and tape hiss through the independent
  * {@link TapeMediumDsp}; {@link DolbyNoiseReductionDsp} supplies the service-manual-confirmed
@@ -51,7 +64,8 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
     private final StereoShelf metalRecordEq;
     private final StereoShelf normalPlaybackEq;
     private final StereoShelf metalPlaybackEq;
-    private final StereoBiquad headHighPass;
+    private final ReplayErrorEq normalReplayError;
+    private final ReplayErrorEq metalReplayError;
     private final StereoPeaking headContour;
     private final StereoBiquad normalBandwidth;
     private final StereoBiquad metalBandwidth;
@@ -140,9 +154,17 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
         normalPlaybackEq = new StereoShelf(sampleRate, normalCorner, 1f / dbToLinear(5.2f));
         metalPlaybackEq = new StereoShelf(sampleRate, metalCorner, 1f / dbToLinear(4.4f));
 
+        // The replay equaliser is solved from Aiwa's own component values rather than approximated
+        // from the spec envelope, so what reaches the output is this machine's real departure from
+        // the IEC characteristic. It supplies the electrical bass rolloff that a spec-derived
+        // high-pass used to stand in for.
+        AiwaHsJx707ReplayEq replayEq = new AiwaHsJx707ReplayEq();
+        normalReplayError = new ReplayErrorEq(sampleRate, replayEq, false);
+        metalReplayError = new ReplayErrorEq(sampleRate, replayEq, true);
+
         // Aiwa specifies a usable band, not a measured centre-line curve. Butterworth corners at
         // the published endpoints keep the model centred safely inside the +/-4.5 dB envelope.
-        headHighPass = StereoBiquad.highPass(sampleRate, Math.min(63f, safeTop), 0.7071f);
+        // The head's own long-wavelength contour stays a prior: the schematic cannot supply it.
         headContour = new StereoPeaking(sampleRate, Math.min(108f, safeTop), 0.82f, 0.85f);
         normalBandwidth = StereoBiquad.lowPass(sampleRate, Math.min(8_000f, safeTop), 0.7071f);
         metalBandwidth = StereoBiquad.lowPass(sampleRate, Math.min(12_500f, safeTop), 0.7071f);
@@ -194,7 +216,8 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
         metalRecordEq.reset();
         normalPlaybackEq.reset();
         metalPlaybackEq.reset();
-        headHighPass.reset();
+        normalReplayError.reset();
+        metalReplayError.reset();
         headContour.reset();
         normalBandwidth.reset();
         metalBandwidth.reset();
@@ -290,8 +313,21 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
                 }
             }
 
-            left = headHighPass.processLeft(left);
-            right = headHighPass.processRight(right);
+            if (transitioning) {
+                float normalLeft = normalReplayError.processLeft(left);
+                float normalRight = normalReplayError.processRight(right);
+                float metalLeft = metalReplayError.processLeft(left);
+                float metalRight = metalReplayError.processRight(right);
+                left = lerp(normalLeft, metalLeft, modeMix);
+                right = lerp(normalRight, metalRight, modeMix);
+            } else if (modeMix >= 1f) {
+                left = metalReplayError.processLeft(left);
+                right = metalReplayError.processRight(right);
+            } else {
+                left = normalReplayError.processLeft(left);
+                right = normalReplayError.processRight(right);
+            }
+
             left = headContour.processLeft(left);
             right = headContour.processRight(right);
 
@@ -338,10 +374,12 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
         if (metal) {
             metalRecordEq.reset();
             metalPlaybackEq.reset();
+            metalReplayError.reset();
             metalBandwidth.reset();
         } else {
             normalRecordEq.reset();
             normalPlaybackEq.reset();
+            normalReplayError.reset();
             normalBandwidth.reset();
         }
     }
@@ -603,6 +641,117 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
         }
     }
 
+    /**
+     * This machine's replay equaliser, as its departure from a perfect IEC deck.
+     *
+     * <p>The record pre-emphasis and its exact inverse either side of the tape stage already carry
+     * the standard characteristic, so what is left for the renderer to add is only the difference
+     * between the curve Aiwa's components actually realise and the curve the standard asks for:
+     * {@code closedLoop(s) / idealReplay(s)}, normalised to unity at 1 kHz. Everything here is
+     * solved from {@link AiwaHsJx707ReplayEq}, so it moves if the transcription moves.</p>
+     *
+     * <p>{@code 1 + Zf/Zg} has two poles and two zeros, and the ideal replay amplifier is the
+     * first-order shelf {@code (1 + s*120us)/(1 + s*3180us)}. Dividing one by the other leaves
+     * three first-order sections. They are paired nearest-neighbour rather than in any natural
+     * order, purely so no single section carries a large gain: the sections come out at ratios of
+     * about 62, 0.92 and 1.27 instead of one section swinging by 36 dB.</p>
+     *
+     * <p>The audible result is small and entirely derived: about -1.3 dB at 63 Hz rising to
+     * +1.2 dB by 16 kHz on Normal, -1.0 dB to +1.9 dB on Cr/Metal, and a bass turnover below
+     * 63 Hz that reaches -4.5 dB at 20 Hz because of C19 and R17.</p>
+     */
+    private static final class ReplayErrorEq {
+        private final StereoFirstOrderShelf bassTurnover;
+        private final StereoFirstOrderShelf bassTrim;
+        private final StereoFirstOrderShelf trebleTilt;
+
+        ReplayErrorEq(int sampleRate, AiwaHsJx707ReplayEq source, boolean metal) {
+            double[] poles = source.poleTimeConstantsSeconds(metal);
+            double[] zeros = source.zeroTimeConstantsSeconds(metal);
+            double idealTreble = metal ? AiwaHsJx707ReplayEq.IEC_METAL_SECONDS
+                    : AiwaHsJx707ReplayEq.IEC_NORMAL_SECONDS;
+            bassTurnover = new StereoFirstOrderShelf(sampleRate, zeros[0], poles[1]);
+            bassTrim = new StereoFirstOrderShelf(sampleRate,
+                    AiwaHsJx707ReplayEq.IEC_BASS_SECONDS, poles[0]);
+            trebleTilt = new StereoFirstOrderShelf(sampleRate, zeros[1], idealTreble);
+        }
+
+        float processLeft(float input) {
+            return trebleTilt.processLeft(
+                    bassTrim.processLeft(bassTurnover.processLeft(input)));
+        }
+
+        float processRight(float input) {
+            return trebleTilt.processRight(
+                    bassTrim.processRight(bassTurnover.processRight(input)));
+        }
+
+        void reset() {
+            bassTurnover.reset();
+            bassTrim.reset();
+            trebleTilt.reset();
+        }
+    }
+
+    /**
+     * {@code (1 + s*zero) / (1 + s*pole)} by the bilinear transform, unity at 1 kHz.
+     *
+     * <p>Normalising every section at 1 kHz rather than only the finished cascade keeps the
+     * intermediate gains near one, which matters because the longest and shortest time constants
+     * in this equaliser are four orders of magnitude apart.</p>
+     */
+    private static final class StereoFirstOrderShelf {
+        private static final double NORMALISE_AT_HERTZ = 1_000.0;
+        private final float b0;
+        private final float b1;
+        private final float a1;
+        private float leftX1;
+        private float leftY1;
+        private float rightX1;
+        private float rightY1;
+
+        StereoFirstOrderShelf(int sampleRate, double zeroSeconds, double poleSeconds) {
+            double rate = 2.0 * sampleRate;
+            double zeroTerm = rate * zeroSeconds;
+            double poleTerm = rate * poleSeconds;
+            double denominator = 1.0 + poleTerm;
+            double rawB0 = (1.0 + zeroTerm) / denominator;
+            double rawB1 = (1.0 - zeroTerm) / denominator;
+            double rawA1 = (1.0 - poleTerm) / denominator;
+
+            double omega = TWO_PI * Math.min(NORMALISE_AT_HERTZ, sampleRate * 0.45) / sampleRate;
+            double cos = Math.cos(omega);
+            double sin = Math.sin(omega);
+            double gain = Math.hypot(rawB0 + rawB1 * cos, -rawB1 * sin)
+                    / Math.hypot(1.0 + rawA1 * cos, -rawA1 * sin);
+
+            b0 = (float) (rawB0 / gain);
+            b1 = (float) (rawB1 / gain);
+            a1 = (float) rawA1;
+        }
+
+        float processLeft(float input) {
+            float output = b0 * input + b1 * leftX1 - a1 * leftY1;
+            leftX1 = input;
+            leftY1 = output;
+            return output;
+        }
+
+        float processRight(float input) {
+            float output = b0 * input + b1 * rightX1 - a1 * rightY1;
+            rightX1 = input;
+            rightY1 = output;
+            return output;
+        }
+
+        void reset() {
+            leftX1 = 0f;
+            leftY1 = 0f;
+            rightX1 = 0f;
+            rightY1 = 0f;
+        }
+    }
+
     private static final class StereoShelf {
         private final float coefficient;
         private final float highGain;
@@ -686,18 +835,6 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
             double alpha = Math.sin(omega) / (2.0 * q);
             double b0 = (1.0 - cos) * 0.5;
             double b1 = 1.0 - cos;
-            double b2 = b0;
-            double a0 = 1.0 + alpha;
-            return new StereoBiquad(b0 / a0, b1 / a0, b2 / a0,
-                    -2.0 * cos / a0, (1.0 - alpha) / a0);
-        }
-
-        static StereoBiquad highPass(int sampleRate, float frequency, float q) {
-            double omega = TWO_PI * frequency / sampleRate;
-            double cos = Math.cos(omega);
-            double alpha = Math.sin(omega) / (2.0 * q);
-            double b0 = (1.0 + cos) * 0.5;
-            double b1 = -(1.0 + cos);
             double b2 = b0;
             double a0 = 1.0 + alpha;
             return new StereoBiquad(b0 / a0, b1 / a0, b2 / a0,

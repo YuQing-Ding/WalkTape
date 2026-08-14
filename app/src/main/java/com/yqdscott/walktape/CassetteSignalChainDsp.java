@@ -42,6 +42,33 @@ final class CassetteSignalChainDsp implements TapeMachineDsp {
         dolby.setMode(mode);
     }
 
+    @Override
+    public void setTapePosition(float position) {
+        machine.setTapePosition(position);
+    }
+
+    @Override
+    public void setTransportState(TapeTransportState state) {
+        machine.setTransportState(state);
+    }
+
+    @Override
+    public void setBatteryDepthOfDischarge(float depth) {
+        machine.setBatteryDepthOfDischarge(depth);
+    }
+
+    /** Record level belongs to the tape, so it stops at the medium stage. */
+    @Override
+    public void setRecordLevel(RecordLevelProfile level) {
+        tape.setRecordLevel(level);
+    }
+
+    /** Only the machine stage looks ahead; the tape, Dolby and wear stages are sample aligned. */
+    @Override
+    public int latencyFrames() {
+        return machine.latencyFrames();
+    }
+
     DolbyMode dolbyMode() {
         return dolby.mode();
     }

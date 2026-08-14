@@ -34,10 +34,11 @@ public final class TapeStockProfile {
             "EARLY FERRIC / DENSE GRAIN",
             0xffe95c2c,
             5.7f,
-            2.12f,
-            0.46f,
+            4.4414f,
+            3.3090f,
+            0.3556f,
             13_600f,
-            -54.8f,
+            -66.48f,
             0.62f,
             0.0045f
     );
@@ -60,10 +61,11 @@ public final class TapeStockProfile {
             "COBALT FERRIC / LOW NOISE",
             0xffd7a23a,
             4.7f,
-            1.68f,
-            0.31f,
+            3.6105f,
+            3.4512f,
+            0.8306f,
             17_200f,
-            -59.5f,
+            -76.17f,
             0.38f,
             0.0028f
     );
@@ -86,10 +88,11 @@ public final class TapeStockProfile {
             "PURE METAL / HIGH HEADROOM",
             0xffb8c7c9,
             4.45f,
-            1.43f,
-            0.20f,
+            2.9190f,
+            3.1871f,
+            0.7518f,
             19_400f,
-            -58.8f,
+            -73.48f,
             0.28f,
             0.0019f
     );
@@ -114,9 +117,12 @@ public final class TapeStockProfile {
     public final String character;
     public final int accentColor;
 
-    // Renderer calibration. These are deliberately not presented as published measurements.
+    // Renderer calibration. These are solved so the rendered stock reproduces the published
+    // measurements above; TapeStockCalibrationTest is the gate that keeps them honest. They are
+    // still not themselves measurements, which is why they stay separate from the public fields.
     final float recordTrebleGainDb;
     final float magneticDrive;
+    final float magneticKnee;
     final float maximumDynamicLoss;
     final float coatingBandwidthHz;
     final float renderedHissRmsDb;
@@ -141,6 +147,7 @@ public final class TapeStockProfile {
                              int accentColor,
                              float recordTrebleGainDb,
                              float magneticDrive,
+                             float magneticKnee,
                              float maximumDynamicLoss,
                              float coatingBandwidthHz,
                              float renderedHissRmsDb,
@@ -164,12 +171,45 @@ public final class TapeStockProfile {
         this.accentColor = accentColor;
         this.recordTrebleGainDb = recordTrebleGainDb;
         this.magneticDrive = magneticDrive;
+        this.magneticKnee = magneticKnee;
         this.maximumDynamicLoss = maximumDynamicLoss;
         this.coatingBandwidthHz = coatingBandwidthHz;
         this.renderedHissRmsDb = renderedHissRmsDb;
         this.modulationNoiseDepth = modulationNoiseDepth;
         this.coatingWanderDepth = coatingWanderDepth;
     }
+
+    /**
+     * Same published stock with different renderer constants, used to solve and to verify them.
+     *
+     * <p>The public measurements are carried through untouched, so a calibration run can only
+     * change how the stock is rendered and never what it claims to be.</p>
+     */
+    static TapeStockProfile withRendererConstants(TapeStockProfile base,
+                                                  float recordTrebleGainDb,
+                                                  float magneticDrive,
+                                                  float magneticKnee,
+                                                  float maximumDynamicLoss,
+                                                  float renderedHissRmsDb) {
+        return new TapeStockProfile(base.id, base.manufacturer, base.model, base.year,
+                base.iecType, base.formulation, base.position, base.replayEqMicroseconds,
+                base.mol315Db, base.sol10kDb, base.biasNoiseDb, base.thdAtReferencePercent,
+                base.relativeBiasDb, base.sensitivityDb, base.character, base.accentColor,
+                recordTrebleGainDb, magneticDrive, magneticKnee, maximumDynamicLoss,
+                base.coatingBandwidthHz, renderedHissRmsDb, base.modulationNoiseDepth,
+                base.coatingWanderDepth);
+    }
+
+    /**
+     * Digital level standing in for the tape industry's reference flux, 200 nWb/m at 315 Hz.
+     *
+     * <p>Every published figure in this class — maximum output level, saturation output level and
+     * bias noise — is quoted relative to it. The level is often called "Dolby level" because Dolby
+     * Laboratories defined it as the alignment point for their noise reduction, but it is a
+     * property of the tape and is the reference whether or not a machine has noise reduction at
+     * all. The TPS-L2 has none; these measurements still apply to the stock it plays.</p>
+     */
+    static final float REFERENCE_FLUX_LEVEL = 0.12589254f; // -18 dBFS
 
     public static TapeStockProfile sonyChf1978() {
         return CHF;

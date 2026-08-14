@@ -31,9 +31,14 @@ public class TapeMediumDspTest {
 
     @Test
     public void renderedHissMatchesEachStocksTargetAndFerricIsClearlyGrainier() {
-        double chfDb = silenceRmsDb(TapeStockProfile.sonyChf1978());
-        double saDb = silenceRmsDb(TapeStockProfile.tdkSa1988());
-        double metalDb = silenceRmsDb(TapeStockProfile.tdkMaX1990());
+        // Replay sensitivity lifts or lowers everything the stock puts out, hiss included. The
+        // coating's own noise target is what is under test here, so take it back out.
+        double chfDb = silenceRmsDb(TapeStockProfile.sonyChf1978())
+                - TapeStockProfile.sonyChf1978().sensitivityDb;
+        double saDb = silenceRmsDb(TapeStockProfile.tdkSa1988())
+                - TapeStockProfile.tdkSa1988().sensitivityDb;
+        double metalDb = silenceRmsDb(TapeStockProfile.tdkMaX1990())
+                - TapeStockProfile.tdkMaX1990().sensitivityDb;
 
         assertEquals(TapeMediumDsp.renderedHissFloorDb(TapeStockProfile.sonyChf1978()),
                 chfDb, 0.8);
@@ -63,15 +68,31 @@ public class TapeMediumDspTest {
     }
 
     @Test
-    public void metalCarriesHotTenKilohertzEnergyBetterThanEarlyFerric() {
-        double chf = renderedRms(TapeStockProfile.sonyChf1978(), 10_000f, 0.52f);
-        double metal = renderedRms(TapeStockProfile.tdkMaX1990(), 10_000f, 0.52f);
-        double chfReference = renderedRms(TapeStockProfile.sonyChf1978(), 1_000f, 0.52f);
-        double metalReference = renderedRms(TapeStockProfile.tdkMaX1990(), 1_000f, 0.52f);
-        double advantageDb = decibels((metal / metalReference) / (chf / chfReference));
+    public void metalReachesAHigherTenKilohertzCeilingThanEarlyFerric() {
+        // The measured advantage of metal at 10 kHz is its saturation ceiling, not its behaviour
+        // at one arbitrary hot level: TDK MA-X publishes SOL10k +0.5 dB against Sony CHF's
+        // -1.4 dB, so the whole difference is 1.9 dB. This used to assert a much larger gap,
+        // which only held while the tape stage had no saturation ceiling at all.
+        double advantageDb = TapeStockProfile.tdkMaX1990().sol10kDb
+                - TapeStockProfile.sonyChf1978().sol10kDb;
+        double chfCeiling = ceilingAtTenKilohertz(TapeStockProfile.sonyChf1978());
+        double metalCeiling = ceilingAtTenKilohertz(TapeStockProfile.tdkMaX1990());
 
-        assertTrue("Type IV SOL should preserve substantially more hot treble: " + advantageDb,
-                advantageDb > 2.5);
+        assertEquals("Rendered ceilings must reproduce the published SOL difference",
+                advantageDb, metalCeiling - chfCeiling, 0.8);
+    }
+
+    /** Highest 10 kHz output the stock can be driven to, in dB relative to its own low-level gain. */
+    private static double ceilingAtTenKilohertz(TapeStockProfile profile) {
+        double reference = TapeStockProfile.REFERENCE_FLUX_LEVEL;
+        double best = 0;
+        for (double driveDb = 0; driveDb <= 40; driveDb += 1.0) {
+            best = Math.max(best, renderedRms(profile, 10_000f,
+                    (float) (reference * Math.pow(10.0, driveDb / 20.0))));
+        }
+        // Published SOL is referenced to recorded flux, so the stock's replay sensitivity comes
+        // back out before the two ceilings are compared.
+        return decibels(best / reference) - profile.sensitivityDb;
     }
 
     @Test

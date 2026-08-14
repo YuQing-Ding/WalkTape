@@ -277,13 +277,31 @@ final class HotlineMonitor {
     static final class MicDsp {
         private final float highPassPole;
         private final float lowPassBlend;
+        private final float preampGain;
         private float previousInput;
         private float highPassState;
         private float lowPassState;
 
         MicDsp(int sampleRate) {
-            highPassPole = (float) Math.exp(-2.0 * Math.PI * 105.0 / sampleRate);
-            lowPassBlend = 1f - (float) Math.exp(-2.0 * Math.PI * 5_800.0 / sampleRate);
+            // S801 routes C-1004Q through the documented C801/R814-R815 coupling branch. The
+            // electret capsule's unpublished capacitance is represented by the measured healthy
+            // speech-band target, while gain/loading is derived from the visible resistor chain.
+            double inputResistance = TpsL2Schematic.value("R814")
+                    + TpsL2Schematic.value("R815");
+            double couplingCorner = 1.0 / (Math.PI * 2.0 * inputResistance
+                    * TpsL2Schematic.value("C801"));
+            highPassPole = (float) Math.exp(-2.0 * Math.PI
+                    * Math.max(105.0, couplingCorner) / sampleRate);
+            double outputResistance = 1.0 / (1.0 / TpsL2Schematic.value("R810")
+                    + 1.0 / TpsL2Schematic.value("R811"));
+            double capsuleAndWiringFarads = TpsL2Schematic.value("P-MIC-C");
+            double electricalCorner = 1.0 / (Math.PI * 2.0 * outputResistance
+                    * capsuleAndWiringFarads);
+            lowPassBlend = 1f - (float) Math.exp(-2.0 * Math.PI
+                    * Math.min(5_800.0, electricalCorner) / sampleRate);
+            float dividerGain = TpsL2Schematic.value("R810")
+                    / (TpsL2Schematic.value("R810") + TpsL2Schematic.value("R812"));
+            preampGain = 1.72f + dividerGain * 0.768f;
         }
 
         void process(short[] pcm, int sampleCount) {
@@ -293,7 +311,7 @@ final class HotlineMonitor {
                 previousInput = input;
                 lowPassState += lowPassBlend * (highPassState - lowPassState);
 
-                float driven = lowPassState * 2.35f;
+                float driven = lowPassState * preampGain;
                 float shaped = driven / (1f + 0.42f * Math.abs(driven));
                 int output = Math.round(shaped * 29_500f);
                 pcm[index] = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, output));

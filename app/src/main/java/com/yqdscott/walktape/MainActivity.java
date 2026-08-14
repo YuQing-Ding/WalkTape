@@ -33,11 +33,13 @@ public class MainActivity extends AppCompatActivity implements
     private static final int REQUEST_MUSIC_LIBRARY = 41;
     private static final int REQUEST_HOTLINE_MICROPHONE = 42;
     private static final int REQUEST_LYRICS_NETWORK = 43;
+    private static final int REQUEST_PLAYBACK_NOTIFICATION = 44;
     private static final String PREFERENCES = "walktape_preferences";
     private static final String KEY_MACHINE_PROFILE = "machine_profile";
     private static final String KEY_TAPE_PROFILE = "tape_profile";
     private static final String KEY_MACHINE_CONDITION = "machine_condition";
     private static final String KEY_DOLBY_MODE = "dolby_mode";
+    private static final String KEY_RECORD_LEVEL = "record_level";
     private final Handler progressHandler = new Handler(Looper.getMainLooper());
     private final float[] playbackMeterLevels = new float[2];
     private final Runnable progressTicker = new Runnable() {
@@ -82,6 +84,7 @@ public class MainActivity extends AppCompatActivity implements
     private boolean immersivePlayer;
     private boolean libraryStarted;
     private boolean permissionRequestIssued;
+    private boolean notificationRequestIssued;
     private boolean manualRefreshRequested;
     private boolean lyricsNetworkCallbackRegistered;
     private boolean lyricsNetworkPermissionRequestIssued;
@@ -119,11 +122,16 @@ public class MainActivity extends AppCompatActivity implements
                         .getString(KEY_DOLBY_MODE, DolbyMode.OFF.id));
         playbackController.setMachineProfile(savedProfile);
         playbackController.setTapeProfile(savedTapeProfile);
+        RecordLevelProfile savedRecordLevel = RecordLevelProfile.forId(
+                getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                        .getString(KEY_RECORD_LEVEL, RecordLevelProfile.STANDARD));
         playbackController.setConditionProfile(savedCondition);
+        playbackController.setRecordLevel(savedRecordLevel);
         playbackController.setDolbyMode(savedDolbyMode);
         walkTapeView.setMachineProfile(savedProfile);
         walkTapeView.setTapeProfile(savedTapeProfile);
         walkTapeView.setConditionProfile(savedCondition);
+        walkTapeView.setRecordLevel(savedRecordLevel);
         walkTapeView.setDolbyMode(savedDolbyMode);
         if (savedProfile.usesTapeTypeSelector()) {
             boolean highPosition = savedTapeProfile.isHighPosition();
@@ -213,6 +221,7 @@ public class MainActivity extends AppCompatActivity implements
         immersivePlayer = true;
         configureWindow(true);
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        requestPlaybackNotificationIfNeeded();
         PlaybackKeepAliveService.showPlaying(this, album, track);
         playbackController.loadAndPlay(track);
     }
@@ -344,6 +353,18 @@ public class MainActivity extends AppCompatActivity implements
                 .putString(KEY_TAPE_PROFILE, profile.id)
                 .apply();
         playbackController.setTapeProfile(profile);
+    }
+
+    @Override
+    public void onRecordLevelChanged(RecordLevelProfile level) {
+        if (level == null) {
+            return;
+        }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_RECORD_LEVEL, level.id)
+                .apply();
+        playbackController.setRecordLevel(level);
     }
 
     @Override
@@ -574,6 +595,28 @@ public class MainActivity extends AppCompatActivity implements
     private boolean hasMusicPermission() {
         return ContextCompat.checkSelfPermission(this, musicPermission())
                 == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /**
+     * Asks for the ongoing-playback notification once, the first time a tape is started.
+     *
+     * <p>The notification is not decoration. It is the visible half of the media foreground
+     * service, and without it Android 13 and later keep the process in a state where the decode
+     * thread loses CPU and I/O priority as soon as the screen turns off, which is heard as
+     * dropouts a minute or two into a track.</p>
+     */
+    private void requestPlaybackNotificationIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
+                || notificationRequestIssued) {
+            return;
+        }
+        notificationRequestIssued = true;
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                    REQUEST_PLAYBACK_NOTIFICATION);
+        }
     }
 
     private String musicPermission() {

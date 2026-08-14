@@ -22,7 +22,10 @@ public final class SonyWmF2015Dsp implements TapeMachineDsp {
     private static final int TRANSPORT_CONTROL_STRIDE = 4;
     private static final float RANDOM_SPEED_RMS = 0.00055f;
     private static final float PROGRAM_CROSSTALK = 0.014f;
-    private static final float ELECTRONICS_NOISE_RMS = dbToLinear(-65.0f);
+    // Re-referenced with the tape stage's calibration to published bias noise. At the old value
+    // this portable's own electronics sat above a correctly quiet Type I stock, which inverted the
+    // physical order: on a real machine the tape is what you hear hissing.
+    private static final float ELECTRONICS_NOISE_RMS = dbToLinear(-79.0f);
 
     // Midway belt/flywheel, idler, capstan belt and motor/roller components. Their quadrature
     // sum with the bounded stochastic term is 0.340 percent RMS.
@@ -385,8 +388,14 @@ public final class SonyWmF2015Dsp implements TapeMachineDsp {
         return 1.5f;
     }
 
+    /**
+     * Realised floor for the whole machine.
+     *
+     * <p>With the electronics brought down to sit under a correctly calibrated tape, what remains
+     * is dominated by the belt, motor and roller bed rather than by the amplifier.</p>
+     */
     static float integratedMachineNoiseFloorDb() {
-        return -65f;
+        return -74f;
     }
 
     private void updateTransport() {

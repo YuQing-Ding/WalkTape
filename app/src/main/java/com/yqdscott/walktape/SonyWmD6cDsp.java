@@ -23,7 +23,10 @@ public final class SonyWmD6cDsp implements TapeMachineDsp {
     private static final int TRANSPORT_CONTROL_STRIDE = 4;
     private static final float RANDOM_SPEED_RMS = 0.00010f;
     private static final float PROGRAM_CROSSTALK = 0.0040f;
-    private static final float MACHINE_NOISE_RMS = dbToLinear(-78f);
+    // Playback electronics only. Re-referenced when the tape stage was calibrated to its published
+    // bias-noise figures: the stock it sits under became some 12 to 15 dB quieter, and a reference
+    // deck's own noise must stay well under the tape rather than becoming the dominant floor.
+    private static final float MACHINE_NOISE_RMS = dbToLinear(-88f);
     private static final float REPLAY_EQ_MISMATCH_DB = 4.68f; // 20 log10(120 us / 70 us)
 
     // Quartz servo residual, flywheel/capstan, pinch system and upper flutter component.
@@ -258,8 +261,9 @@ public final class SonyWmD6cDsp implements TapeMachineDsp {
         return 0.30f;
     }
 
+    /** Realised floor: the playback electronics plus the mechanical bed that sits above them. */
     static float machineNoiseFloorDb() {
-        return -78f;
+        return -86.8f;
     }
 
     private void updateTransport() {
