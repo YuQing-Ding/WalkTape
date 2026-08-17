@@ -16,6 +16,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.Process;
+import android.util.Log;
 
 import com.beatofthedrum.alacdecoder.ParallelAlacFrameDecoder;
 
@@ -36,8 +37,24 @@ public final class PlaybackController {
     // Public AudioFormat values added after our minSdk; numeric constants keep old devices safe.
     private static final int PCM_24_BIT_PACKED = 21;
     private static final int PCM_32_BIT = 22;
+    /**
+     * 24 bits right-justified in a 32-bit word — the audio HAL's {@code 8_24}, which AudioFormat
+     * has no constant for. Negative so it can never collide with a platform encoding: it only ever
+     * describes what arrives, never what is asked of AudioTrack, whose output is always float.
+     */
+    private static final int PCM_24_IN_32_BIT = -24;
+    /** A raw PCM access unit larger than this is not a sample buffer worth measuring. */
+    private static final int MAX_MEASURED_PACKET_BYTES = 4 << 20;
     private static final int AUDIO_PRIME_MS = 450;
     private static final int TONE_CHANGE_PRIME_MS = 120;
+    /**
+     * How long the transport is allowed to keep running after PAUSE or STOP is pressed.
+     *
+     * <p>A released pinch roller stops the tape with a time constant near 110 ms, so four of
+     * them is where the coast has become inaudible. Pausing the output before that is what made
+     * every key press sound like a switch instead of a mechanism.</p>
+     */
+    private static final int COAST_OUT_MS = 420;
     private static final int AUDIO_BUFFER_MS = 2_000;
     // The Java reserve is what absorbs a storage stall, a codec hiccup or a GC pause. Six seconds
     // costs about 2.3 MB at 48 kHz and is the difference between riding out a slow FUSE read and
@@ -89,6 +106,7 @@ public final class PlaybackController {
     private volatile float ducking = 1f;
     private volatile boolean highTape = true;
     private volatile DolbyMode dolbyMode = DolbyMode.OFF;
+    private volatile boolean bbeEnabled;
     private volatile TapeMachineProfile machineProfile =
             TapeMachineProfile.sonyTpsL2Reference();
     private volatile TapeStockProfile tapeProfile = TapeStockProfile.sonyChf1978();
@@ -133,6 +151,7 @@ public final class PlaybackController {
         next.setRecordLevel(recordLevel);
         next.setHighTape(highTape);
         next.setDolbyMode(dolbyMode);
+        next.setBbeEnabled(bbeEnabled);
         session = next;
         next.start();
     }
@@ -238,6 +257,18 @@ public final class PlaybackController {
         if (active != null) {
             active.setDolbyMode(selected);
         }
+    }
+
+    public void setBbeEnabled(boolean enabled) {
+        bbeEnabled = enabled;
+        DecoderSession active = session;
+        if (active != null) {
+            active.setBbeEnabled(enabled);
+        }
+    }
+
+    boolean isBbeEnabledForTest() {
+        return bbeEnabled;
     }
 
     DolbyMode getDolbyModeForTest() {
@@ -411,6 +442,7 @@ public final class PlaybackController {
         private volatile float sessionDucking = 1f;
         private volatile boolean sessionHighTape;
         private volatile DolbyMode sessionDolbyMode = DolbyMode.OFF;
+        private volatile boolean sessionBbeEnabled;
         private volatile TapeMachineProfile sessionProfile =
                 TapeMachineProfile.sonyTpsL2Reference();
         private volatile TapeStockProfile sessionTapeProfile = TapeStockProfile.sonyChf1978();
@@ -429,12 +461,15 @@ public final class PlaybackController {
 
         private MediaExtractor extractor;
         private MediaPacketSource packetSource;
-        private final PlaybackHealth health = new PlaybackHealth("tps-l2");
+        private final PlaybackHealth health = new PlaybackHealth(machineProfile.id);
         private MediaCodec codec;
         private String sourceMime;
         private String decoderName;
         private long pendingSeekUs = NO_SEEK;
         private boolean pendingSeekPreservesDsp;
+        /** True while the tape is still coasting after PAUSE, before the output really stops. */
+        private boolean coastingOut;
+        private final Runnable coastOutPause = this::completeCoastOutPause;
         private boolean consumedSeekPreservesDsp;
         private long discardBeforeUs = NO_SEEK;
         private int inputSampleRate;
@@ -477,7 +512,33 @@ public final class PlaybackController {
                 }
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
                 extractor = new MediaExtractor();
-                extractor.setDataSource(appContext, uri, null);
+                AiffStreamReader.Format aiff = null;
+                try {
+                    extractor.setDataSource(appContext, uri, null);
+                } catch (Exception platformRefused) {
+                    // AOSP ships no AIFF extractor at all — not a limit that can be worked around
+                    // by asking differently — so read the container here instead of giving up.
+                    aiff = readAiffHeader();
+                    if (aiff == null || !aiff.isPlayable()) {
+                        throw platformRefused;
+                    }
+                }
+                if (aiff != null) {
+                    sourceMime = "audio/x-aiff";
+                    decoderName = "WalkTape AIFF reader";
+                    long aiffDurationUs = aiff.durationUs();
+                    if (aiffDurationUs > 0) {
+                        durationMs = aiffDurationUs / 1_000L;
+                    }
+                    decodeAiff(aiff);
+                    if (!stopRequested) {
+                        finished = true;
+                        prepared = false;
+                        fallbackPositionMs = durationMs;
+                        postCompleted(this);
+                    }
+                    return;
+                }
                 int audioTrackIndex = findAudioTrack(extractor);
                 if (audioTrackIndex < 0) {
                     throw new PlaybackFailure("文件里没有可播放的音轨");
@@ -516,44 +577,106 @@ public final class PlaybackController {
                 if (!stopRequested) {
                     finished = true;
                     prepared = false;
-                    postError(this, readableFailure(error));
+                    String message = readableFailure(error);
+                    // The toast is a summary and can be missed; the stack trace names the codec or
+                    // the extractor that actually refused the file, which is what a bug report
+                    // needs. Logged here so a failure is diagnosable from logcat alone.
+                    Log.w(PlaybackHealth.TAG, "decode failed: " + message + " uri=" + uri, error);
+                    postError(this, message);
                 }
             } finally {
                 releaseDecoderResources();
             }
         }
 
+        /**
+         * PLAY or PAUSE, given to the transport rather than to the output.
+         *
+         * <p>The output is no longer stopped on the key press. Pausing hands the renderer a PAUSE
+         * command and then flushes the render-ahead back to the audible playhead, so what plays
+         * next is the tape actually coasting to a halt against the head rather than several
+         * seconds of programme that was rendered while it was still running. Only once that coast
+         * has played does the output really pause.</p>
+         *
+         * <p>The flush is the state-preserving kind: the renderer is not reset, because a transport
+         * that reset here would snap to a standstill and there would be nothing to hear.</p>
+         */
         boolean toggle() {
             synchronized (controlLock) {
                 if (!prepared || finished || stopRequested) {
                     return false;
                 }
-                paused = !paused;
-                sessionTransportState = paused
-                        ? TapeTransportState.PAUSED : TapeTransportState.STARTING;
-                TapeMachineDsp renderer = dsp;
-                if (renderer != null) {
-                    renderer.setTransportState(sessionTransportState);
+                if (coastingOut) {
+                    // Caught mid-coast: cancel the stop and wind back up from whatever speed the
+                    // tape still has, which is what a real machine does too.
+                    mainHandler.removeCallbacks(coastOutPause);
+                    coastingOut = false;
+                    startTransportTransition(TapeTransportState.STARTING);
+                    controlLock.notifyAll();
+                    return true;
                 }
+                if (paused) {
+                    paused = false;
+                    startTransportTransition(TapeTransportState.STARTING);
+                    AudioTrack output = audioTrack;
+                    if (output != null && outputStarted) {
+                        try {
+                            output.play();
+                        } catch (IllegalStateException ignored) {
+                            // The decoder thread will recreate or release the output as needed.
+                        }
+                    }
+                    controlLock.notifyAll();
+                    return true;
+                }
+                // Keep decoding: the coast has to be rendered before the output may stop.
+                coastingOut = true;
+                startTransportTransition(TapeTransportState.PAUSED);
+                mainHandler.postDelayed(coastOutPause, COAST_OUT_MS);
+                controlLock.notifyAll();
+                return false;
+            }
+        }
+
+        /**
+         * Publishes a transport command and re-renders from the audible playhead.
+         *
+         * <p>Order matters: {@code requestSeek} rewrites the session's transport state for the
+         * electrical selectors that also use a preserving seek, so the real command is set after
+         * it rather than before, or a PAUSE would be overwritten with PLAY on its way through.</p>
+         */
+        private void startTransportTransition(TapeTransportState state) {
+            requestSeek(getPositionMs(), TONE_CHANGE_PRIME_MS, true);
+            sessionTransportState = state;
+            TapeMachineDsp renderer = dsp;
+            if (renderer != null) {
+                renderer.setTransportState(state);
+            }
+        }
+
+        /** Runs once the coast has had time to play, and only then stops the output. */
+        private void completeCoastOutPause() {
+            synchronized (controlLock) {
+                if (!coastingOut || stopRequested || finished) {
+                    coastingOut = false;
+                    return;
+                }
+                coastingOut = false;
+                paused = true;
                 AudioTrack output = audioTrack;
                 if (output != null) {
                     try {
-                        if (paused) {
-                            output.pause();
-                        } else if (outputStarted) {
-                            output.play();
-                        }
+                        output.pause();
                     } catch (IllegalStateException ignored) {
                         // The decoder thread will recreate or release the output as needed.
                     }
                 }
                 controlLock.notifyAll();
-                return !paused;
             }
         }
 
         boolean isPlaying() {
-            return prepared && !paused && !finished && !stopRequested;
+            return prepared && !paused && !coastingOut && !finished && !stopRequested;
         }
 
         boolean isFinished() {
@@ -689,6 +812,22 @@ public final class PlaybackController {
             }
         }
 
+        void setBbeEnabled(boolean enabled) {
+            boolean changed = sessionBbeEnabled != enabled;
+            sessionBbeEnabled = enabled;
+            TapeMachineDsp renderer = dsp;
+            if (renderer != null) {
+                renderer.setBbeEnabled(enabled);
+            }
+            if (changed && prepared && !finished && !stopRequested) {
+                // Same reason as the tone switch: PCM already rendered ahead still carries the
+                // previous setting, so flush back to the audible playhead and let one press of
+                // the switch be heard now rather than several seconds from now. BBE adds no
+                // latency of its own, so the light tone-change cushion is enough.
+                requestSeek(getPositionMs(), TONE_CHANGE_PRIME_MS, true);
+            }
+        }
+
         void setMachineProfile(TapeMachineProfile profile) {
             TapeMachineProfile selected = profile == null
                     ? TapeMachineProfile.sonyTpsL2Reference()
@@ -805,6 +944,254 @@ public final class PlaybackController {
             return count;
         }
 
+        /** Reads enough of the file for {@link AiffStreamReader} to find COMM and SSND. */
+        private AiffStreamReader.Format readAiffHeader() {
+            byte[] header = new byte[8_192];
+            int filled = 0;
+            try (java.io.InputStream stream =
+                         appContext.getContentResolver().openInputStream(uri)) {
+                if (stream == null) {
+                    return null;
+                }
+                while (filled < header.length) {
+                    int read = stream.read(header, filled, header.length - filled);
+                    if (read < 0) {
+                        break;
+                    }
+                    filled += read;
+                }
+            } catch (Exception unreadable) {
+                return null;
+            }
+            return AiffStreamReader.parse(header, filled);
+        }
+
+        /**
+         * Plays an AIFF by reading its PCM directly, with no platform extractor in the path.
+         *
+         * <p>Seeking reopens the stream and skips, because a content stream is not reliably
+         * seekable in place. AIFF is constant bit rate, so the byte offset of any frame is exact
+         * arithmetic rather than a search, and a seek lands sample-accurately.</p>
+         */
+        private void decodeAiff(AiffStreamReader.Format format) throws Exception {
+            configureOutput(format.sampleRate, format.channels,
+                    AudioFormat.ENCODING_PCM_16BIT);
+            final int bytesPerFrame = format.bytesPerFrame();
+            if (bytesPerFrame <= 0) {
+                throw new PlaybackFailure("AIFF 头里的字长无效");
+            }
+            final int framesPerBlock = 4_096;
+            byte[] raw = new byte[framesPerBlock * bytesPerFrame];
+            byte[] pcm = new byte[framesPerBlock * format.channels * 2];
+            ByteBuffer converted = ByteBuffer.wrap(pcm);
+            long totalFrames = format.frameCount > 0
+                    ? format.frameCount : format.dataBytes / bytesPerFrame;
+            long framePosition = 0;
+            java.io.InputStream stream = openAiffStream(format, 0);
+            try {
+                while (!stopRequested) {
+                    waitWhilePaused();
+                    long seekUs = consumeSeek();
+                    if (seekUs != NO_SEEK) {
+                        long target = Math.max(0L,
+                                Math.min(totalFrames, seekUs * format.sampleRate / 1_000_000L));
+                        closeQuietly(stream);
+                        stream = openAiffStream(format, target);
+                        framePosition = target;
+                        resetAfterSeek(seekUs);
+                    }
+                    if (stopRequested || paused) {
+                        continue;
+                    }
+
+                    long readStart = System.nanoTime();
+                    int read = readBlock(stream, raw);
+                    health.addReadNanos(System.nanoTime() - readStart);
+                    int usable = read - (read % bytesPerFrame);
+                    if (usable <= 0) {
+                        flushRendererTail();
+                        if (waitForAudioDrain()) {
+                            return;
+                        }
+                        continue;
+                    }
+                    int written = AiffStreamReader.toLittleEndian16(raw, usable,
+                            format.bitsPerSample, format.bigEndian, pcm);
+                    converted.limit(pcm.length);
+                    converted.position(0);
+                    writePcm(converted, 0, written, AudioFormat.ENCODING_PCM_16BIT,
+                            format.channels,
+                            framePosition * 1_000_000L / format.sampleRate);
+                    framePosition += usable / bytesPerFrame;
+                    health.reportIfDue();
+                }
+            } finally {
+                closeQuietly(stream);
+            }
+        }
+
+        private java.io.InputStream openAiffStream(AiffStreamReader.Format format, long frame)
+                throws Exception {
+            java.io.InputStream stream = appContext.getContentResolver().openInputStream(uri);
+            if (stream == null) {
+                throw new PlaybackFailure("无法读取这个 AIFF 文件");
+            }
+            long skip = format.dataOffset + frame * format.bytesPerFrame();
+            while (skip > 0) {
+                long moved = stream.skip(skip);
+                if (moved <= 0) {
+                    if (stream.read() < 0) {
+                        break;
+                    }
+                    moved = 1;
+                }
+                skip -= moved;
+            }
+            return stream;
+        }
+
+        private int readBlock(java.io.InputStream stream, byte[] block) throws Exception {
+            int filled = 0;
+            while (filled < block.length) {
+                int read = stream.read(block, filled, block.length - filled);
+                if (read < 0) {
+                    break;
+                }
+                filled += read;
+            }
+            return filled;
+        }
+
+        private void closeQuietly(java.io.Closeable closeable) {
+            if (closeable == null) {
+                return;
+            }
+            try {
+                closeable.close();
+            } catch (Exception ignored) {
+                // Nothing useful to do with a failure to close a finished stream.
+            }
+        }
+
+        /**
+         * Works out how wide the extractor's raw PCM samples really are.
+         *
+         * <p>Reached when the extractor tags its raw output with an encoding that is not an AOSP
+         * {@code AudioFormat} value. Hi-res vendor builds of Android 7 do exactly this: a Sony
+         * device reports encoding 100 for a file it demuxes and decodes itself, and no constant
+         * table anywhere in the platform says what that means. There is no decoder to restart in
+         * this path, so the word length has to be established rather than looked up.</p>
+         *
+         * <p>It is measured from the stream instead of guessed. One sample buffer's byte count
+         * divided by the frames between its timestamp and the next one's gives bytes per frame
+         * directly, whatever the tag claims. That is arithmetic on the extractor's own numbers, so
+         * it holds for any private encoding this or another vendor invents.</p>
+         *
+         * <p>Only four bytes per sample stay ambiguous, being float, a full-scale 32-bit integer or
+         * a 24-bit sample right-justified in a 32-bit word — the audio HAL's {@code 8_24}, which is
+         * how a hi-res path most often carries 24 bits. Those are told apart by the peak of a real
+         * buffer, falling back to the container's own word length when the opening is silent.</p>
+         *
+         * @return a readable encoding, or 0 when the stream did not give enough to be sure
+         */
+        private int measureRawPcmEncoding(MediaFormat format, int sampleRate, int channels,
+                                          AudioContainerProbe.Result probed) {
+            if (extractor == null || sampleRate <= 0 || channels <= 0) {
+                return 0;
+            }
+            try {
+                // readSampleData returns the size and has existed since API 16; getSampleSize
+                // would say the same thing but only arrived in API 28, and the devices that make
+                // this measurement necessary are older than that.
+                int capacity = Math.max(RAW_PCM_PACKET_BYTES,
+                        formatInt(format, MediaFormat.KEY_MAX_INPUT_SIZE, 0) + 16);
+                if (capacity > MAX_MEASURED_PACKET_BYTES) {
+                    return 0;
+                }
+                long firstUs = extractor.getSampleTime();
+                ByteBuffer sample = ByteBuffer.allocate(capacity);
+                int read = extractor.readSampleData(sample, 0);
+                if (firstUs < 0 || read <= 0 || !extractor.advance()) {
+                    return 0;
+                }
+                long secondUs = extractor.getSampleTime();
+                if (secondUs <= firstUs) {
+                    return 0;
+                }
+                long frames = Math.round((secondUs - firstUs) * sampleRate / 1_000_000.0);
+                if (frames <= 0) {
+                    return 0;
+                }
+                int bytesPerFrame = (int) Math.round((double) read / frames);
+                // The buffer has to be the frames it claims to span, to within one frame of
+                // rounding. Anything else means these timestamps do not describe these bytes.
+                if (bytesPerFrame <= 0 || bytesPerFrame % channels != 0
+                        || Math.abs(read - frames * bytesPerFrame) > bytesPerFrame) {
+                    return 0;
+                }
+                switch (bytesPerFrame / channels) {
+                    case 1:
+                        return AudioFormat.ENCODING_PCM_8BIT;
+                    case 2:
+                        return AudioFormat.ENCODING_PCM_16BIT;
+                    case 3:
+                        return PCM_24_BIT_PACKED;
+                    case 4:
+                        return measureThirtyTwoBitLayout(sample, read,
+                                probed == null ? 0 : probed.bitsPerSample);
+                    default:
+                        return 0;
+                }
+            } catch (RuntimeException unreadable) {
+                return 0;
+            } finally {
+                extractor.seekTo(0L, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+            }
+        }
+
+        /**
+         * Resolves a raw PCM encoding the platform tagged with a value this app does not know.
+         *
+         * <p>What the stream measures as is preferred over what any header says, because the bytes
+         * being handed over are the thing that has to be read correctly. The container's own word
+         * length is the fallback, and only when it describes uncompressed PCM at the same rate and
+         * channel count — reading samples at the wrong width plays as noise rather than as an
+         * error, so an unresolved encoding stays an error.</p>
+         */
+        private int resolveRawPcmEncoding(int reported, MediaFormat format,
+                                          int sampleRate, int channels)
+                throws UnsupportedPcmEncoding {
+            AudioContainerProbe.Result probed;
+            try {
+                probed = AudioContainerProbe.probe(appContext, uri);
+            } catch (Throwable unreadable) {
+                probed = null;
+            }
+            String header = probed == null ? "unreadable" : probed.describe();
+            int measured = measureRawPcmEncoding(format, sampleRate, channels, probed);
+            if (measured != 0) {
+                Log.w(PlaybackHealth.TAG, "extractor reported PCM encoding " + reported
+                        + "; its samples measure as " + describeEncoding(measured)
+                        + ". header=" + header + " format=" + format);
+                return measured;
+            }
+            boolean uncompressed = probed != null
+                    && (probed.container == AudioContainerProbe.Container.RIFF_WAVE
+                        || probed.container == AudioContainerProbe.Container.RF64
+                        || probed.container == AudioContainerProbe.Container.AIFF)
+                    && "PCM".equals(probed.sampleFormat)
+                    && probed.sampleRate == sampleRate && probed.channels == channels;
+            int fromHeader = uncompressed ? encodingForWordLength(probed.bitsPerSample) : 0;
+            if (fromHeader == 0) {
+                Log.w(PlaybackHealth.TAG, "unresolved PCM encoding " + reported
+                        + ". header=" + header + " format=" + format);
+                throw new UnsupportedPcmEncoding(reported, header);
+            }
+            Log.w(PlaybackHealth.TAG, "extractor reported PCM encoding " + reported
+                    + "; reading it as its header's " + header);
+            return fromHeader;
+        }
+
         private void decodeRawPcm(MediaFormat format) throws Exception {
             int sampleRate = formatInt(format, MediaFormat.KEY_SAMPLE_RATE, 44_100);
             int channels = formatInt(format, MediaFormat.KEY_CHANNEL_COUNT, 2);
@@ -812,6 +1199,9 @@ public final class PlaybackController {
                     AudioFormat.ENCODING_PCM_16BIT);
             if (encoding == AudioFormat.ENCODING_DEFAULT) {
                 encoding = AudioFormat.ENCODING_PCM_16BIT;
+            }
+            if (bytesPerSample(encoding) == 0) {
+                encoding = resolveRawPcmEncoding(encoding, format, sampleRate, channels);
             }
             configureOutput(sampleRate, channels, encoding);
 
@@ -1008,9 +1398,67 @@ public final class PlaybackController {
             }
         }
 
+        /**
+         * Decodes through MediaCodec, retreating to 16-bit output if the codec answers with a PCM
+         * encoding this app does not know how to read.
+         *
+         * <p>Asking for float PCM is allowed from API 24, but the vendor OMX components of that era
+         * do not all answer it in the vocabulary the platform documents. A Sony hi-res device on
+         * 7.1.1 reports encoding 100 — no AOSP {@code AudioFormat} constant — for the same file a
+         * modern device decodes as float. There is no safe way to guess what the bytes behind an
+         * unknown tag are, so the decoder is simply started again on the 16-bit output that every
+         * MediaCodec is required to produce, rather than refusing to play the track.</p>
+         *
+         * <p>The retry is only reachable before a single frame has been rendered: an unknown
+         * encoding is discovered at the codec's first output format, so nothing audible has to be
+         * unwound.</p>
+         */
         private void decodeCompressed(MediaFormat sourceFormat) throws Exception {
-            startDecoderWithBestPcm(sourceFormat);
+            try {
+                startDecoderWithBestPcm(sourceFormat);
+                decodeCompressedPackets(sourceFormat);
+            } catch (UnsupportedPcmEncoding vendorEncoding) {
+                if (audioTrack != null) {
+                    // Output already running, so this is a format change part-way through a track.
+                    // Restarting here would jump the tape back to its beginning; report instead.
+                    throw vendorEncoding;
+                }
+                MediaFormat reported = null;
+                try {
+                    reported = codec == null ? null : codec.getOutputFormat();
+                } catch (Throwable unavailable) {
+                    // The codec may already be unusable; the encoding value alone still says why.
+                }
+                Log.w(PlaybackHealth.TAG, "decoder " + decoderName + " reported PCM encoding "
+                        + vendorEncoding.encoding + "; restarting at 16-bit. output format="
+                        + reported, vendorEncoding);
+                discardDecoderForRetry();
+                startDecoderWith16BitPcm(sourceFormat);
+                decodeCompressedPackets(sourceFormat);
+            }
+        }
 
+        /** Releases the decoder and rewinds the extractor so decoding can start over. */
+        private void discardDecoderForRetry() {
+            if (packetSource != null) {
+                packetSource.close();
+                packetSource = null;
+            }
+            if (codec != null) {
+                try {
+                    codec.stop();
+                } catch (IllegalStateException ignored) {
+                    // Already in an error state; release is all that is left to do.
+                }
+                codec.release();
+                codec = null;
+            }
+            if (extractor != null) {
+                extractor.seekTo(0L, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+            }
+        }
+
+        private void decodeCompressedPackets(MediaFormat sourceFormat) throws Exception {
             packetSource = createPacketSource(sourceFormat, COMPRESSED_PACKET_BYTES,
                     PACKET_QUEUE_DEPTH);
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
@@ -1136,17 +1584,27 @@ public final class PlaybackController {
                     // Continue with the mandatory 16-bit decoder output path.
                 }
                 codec = null;
-                sourceFormat.setInteger(MediaFormat.KEY_PCM_ENCODING,
-                        AudioFormat.ENCODING_PCM_16BIT);
                 try {
-                    codec = createDecoder(sourceFormat, sourceMime);
-                    codec.configure(sourceFormat, null, null, 0);
-                    codec.start();
+                    startDecoderWith16BitPcm(sourceFormat);
                 } catch (Exception fallbackFailure) {
                     fallbackFailure.addSuppressed(floatPcmUnavailable);
                     throw fallbackFailure;
                 }
             }
+        }
+
+        /**
+         * Starts the decoder on the one output format every MediaCodec must produce.
+         *
+         * <p>16-bit PCM is mandatory for every audio decoder, so this is the format to retreat to
+         * when a codec answers the float request with something this app cannot read.</p>
+         */
+        private void startDecoderWith16BitPcm(MediaFormat sourceFormat) throws Exception {
+            sourceFormat.setInteger(MediaFormat.KEY_PCM_ENCODING,
+                    AudioFormat.ENCODING_PCM_16BIT);
+            codec = createDecoder(sourceFormat, sourceMime);
+            codec.configure(sourceFormat, null, null, 0);
+            codec.start();
         }
 
         private MediaCodec createDecoder(MediaFormat format, String mime) throws Exception {
@@ -1181,7 +1639,7 @@ public final class PlaybackController {
                 encoding = AudioFormat.ENCODING_PCM_16BIT;
             }
             if (bytesPerSample(encoding) == 0) {
-                throw new PlaybackFailure("暂不支持解码器输出的 PCM 编码：" + encoding);
+                throw new UnsupportedPcmEncoding(encoding);
             }
             int renderSampleRate = chooseRenderSampleRate(sampleRate);
             if (audioTrack != null && inputSampleRate == sampleRate
@@ -1221,6 +1679,7 @@ public final class PlaybackController {
                     renderSampleRate);
             renderer.setHighTape(sessionHighTape);
             renderer.setDolbyMode(sessionDolbyMode);
+            renderer.setBbeEnabled(sessionBbeEnabled);
             renderer.setRecordLevel(sessionRecordLevel);
             renderer.setTapePosition(durationMs <= 0 ? 0.5f
                     : Math.max(0f, Math.min(1f, fallbackPositionMs / (float) durationMs)));
@@ -1229,6 +1688,7 @@ public final class PlaybackController {
             dsp = renderer;
             resetRendererLatency(renderer);
             dspProfileId = sessionProfile.id;
+            health.setLabel(sessionProfile.id);
             dspTapeProfileId = sessionTapeProfile.id;
             dspConditionProfileId = sessionConditionProfile.id;
             audioTrack = output;
@@ -1722,6 +2182,7 @@ public final class PlaybackController {
             if (renderer != null) {
                 renderer.setHighTape(sessionHighTape);
                 renderer.setDolbyMode(sessionDolbyMode);
+                renderer.setBbeEnabled(sessionBbeEnabled);
                 renderer.setRecordLevel(sessionRecordLevel);
                 renderer.setTapePosition(durationMs <= 0 ? 0.5f
                         : Math.max(0f, Math.min(1f,
@@ -2122,6 +2583,15 @@ public final class PlaybackController {
             if (error instanceof PlaybackFailure && error.getMessage() != null) {
                 return error.getMessage();
             }
+            if (sourceMime == null) {
+                // Nothing was ever demuxed, so the platform refused the container itself. Its own
+                // message is the same single sentence for every cause, which is useless to act on:
+                // read the file's header and say what it actually is.
+                String diagnosis = describeUnreadableContainer(error);
+                if (diagnosis != null) {
+                    return diagnosis;
+                }
+            }
             StringBuilder message = new StringBuilder("无法解码");
             if (sourceMime != null) {
                 message.append(' ').append(friendlyMime(sourceMime));
@@ -2144,7 +2614,44 @@ public final class PlaybackController {
             return message.toString();
         }
 
+        /**
+         * Names the container the platform would not open, or null when the header says nothing.
+         *
+         * <p>Deliberately reports what was read rather than what is supported, so a file that turns
+         * out to be perfectly ordinary points the finger at this app instead of at itself.</p>
+         */
+        private String describeUnreadableContainer(Throwable error) {
+            AudioContainerProbe.Result probed;
+            try {
+                probed = AudioContainerProbe.probe(appContext, uri);
+            } catch (Throwable ignored) {
+                return null;
+            }
+            if (probed.container == AudioContainerProbe.Container.UNKNOWN
+                    && probed.sampleRate == 0) {
+                return null;
+            }
+            StringBuilder message = new StringBuilder();
+            if (probed.isDsd()) {
+                message.append("DSD 暂不支持：");
+            } else {
+                message.append("系统无法打开这个容器：");
+            }
+            message.append(probed.describe());
+            String reason = probed.likelyReason();
+            if (!reason.isEmpty()) {
+                message.append("，").append(reason);
+            }
+            String detail = error == null ? null : error.getMessage();
+            if (detail != null && !detail.trim().isEmpty()) {
+                message.append("（").append(detail.trim()).append('）');
+            }
+            return message.toString();
+        }
+
         private void releaseDecoderResources() {
+            mainHandler.removeCallbacks(coastOutPause);
+            coastingOut = false;
             audioLevels.clear();
             // The reader thread owns the extractor, so it must be stopped before release().
             if (packetSource != null) {
@@ -2391,11 +2898,89 @@ public final class PlaybackController {
                 return 2;
             case AudioFormat.ENCODING_PCM_FLOAT:
             case PCM_32_BIT:
+            case PCM_24_IN_32_BIT:
                 return 4;
             case PCM_24_BIT_PACKED:
                 return 3;
             default:
                 return 0;
+        }
+    }
+
+    /**
+     * Tells float, full-scale 32-bit and right-justified 24-in-32 apart by what is in the samples.
+     *
+     * <p>Four bytes per sample is the one width that does not identify itself. The three layouts
+     * are distinguished by where a real buffer's peak lands: float audio peaks somewhere inside
+     * unity, a full-scale integer stream reaches past the 24th bit, and one that never does is 24
+     * bits sitting in the low end of a 32-bit word — read as full scale it would play 48 dB down.
+     * The float test insists on an audible peak as well as a bounded one, because a quiet integer
+     * stream reinterpreted as float is a mess of denormals that are all finite and all tiny.</p>
+     *
+     * @param headerBits the container's own word length, used only when the buffer is silent
+     */
+    static int measureThirtyTwoBitLayout(ByteBuffer sample, int length, int headerBits) {
+        // Absolute reads only: ByteBuffer's position(int)/limit(int) covariant overrides do not
+        // exist in the libcore of the old devices this measurement is for, and a JDK 11 compiler
+        // binds to them happily enough to fail at runtime there.
+        ByteBuffer words = sample.duplicate();
+        words.order(ByteOrder.LITTLE_ENDIAN);
+        int end = Math.min(length, words.capacity()) & ~3;
+        long peak = 0;
+        float floatPeak = 0f;
+        boolean finiteFloats = true;
+        for (int at = 0; at < end; at += 4) {
+            int word = words.getInt(at);
+            float asFloat = Float.intBitsToFloat(word);
+            if (Float.isFinite(asFloat)) {
+                floatPeak = Math.max(floatPeak, Math.abs(asFloat));
+            } else {
+                finiteFloats = false;
+            }
+            peak = Math.max(peak, Math.abs((long) word));
+        }
+        if (peak == 0) {
+            // Silence reads the same at every scale. The header's word length is all that is left.
+            return headerBits == 24 ? PCM_24_IN_32_BIT : PCM_32_BIT;
+        }
+        if (finiteFloats && floatPeak <= 1.5f && floatPeak >= 1e-4f) {
+            return AudioFormat.ENCODING_PCM_FLOAT;
+        }
+        return peak < (1L << 23) ? PCM_24_IN_32_BIT : PCM_32_BIT;
+    }
+
+    /** Maps a container's stated word length onto the encoding that reads it. */
+    private static int encodingForWordLength(int bitsPerSample) {
+        switch (bitsPerSample) {
+            case 8:
+                return AudioFormat.ENCODING_PCM_8BIT;
+            case 16:
+                return AudioFormat.ENCODING_PCM_16BIT;
+            case 24:
+                return PCM_24_BIT_PACKED;
+            case 32:
+                return PCM_32_BIT;
+            default:
+                return 0;
+        }
+    }
+
+    private static String describeEncoding(int encoding) {
+        switch (encoding) {
+            case AudioFormat.ENCODING_PCM_8BIT:
+                return "8-bit PCM";
+            case AudioFormat.ENCODING_PCM_16BIT:
+                return "16-bit PCM";
+            case AudioFormat.ENCODING_PCM_FLOAT:
+                return "float PCM";
+            case PCM_24_BIT_PACKED:
+                return "24-bit packed PCM";
+            case PCM_24_IN_32_BIT:
+                return "24-bit PCM in 32-bit words";
+            case PCM_32_BIT:
+                return "32-bit PCM";
+            default:
+                return "PCM encoding " + encoding;
         }
     }
 
@@ -2416,6 +3001,8 @@ public final class PlaybackController {
                 return packed / 8_388_608f;
             case PCM_32_BIT:
                 return (float) (source.getInt() / 2_147_483_648.0);
+            case PCM_24_IN_32_BIT:
+                return source.getInt() / 8_388_608f;
             default:
                 return 0f;
         }
@@ -2649,13 +3236,34 @@ public final class PlaybackController {
         }
     }
 
-    private static final class PlaybackFailure extends Exception {
+    private static class PlaybackFailure extends Exception {
         PlaybackFailure(String message) {
             super(message);
         }
 
         PlaybackFailure(String message, Throwable cause) {
             super(message, cause);
+        }
+    }
+
+    /**
+     * A PCM encoding tag that is not one of the AudioFormat values this app can read.
+     *
+     * <p>Separate from a plain failure because it is recoverable: a decoder can be restarted on
+     * 16-bit output, and an uncompressed file's real word length can be read out of its own
+     * header. It carries the value so both the retry and the log can name it.</p>
+     */
+    private static final class UnsupportedPcmEncoding extends PlaybackFailure {
+        final int encoding;
+
+        UnsupportedPcmEncoding(int encoding) {
+            super("暂不支持解码器输出的 PCM 编码：" + encoding);
+            this.encoding = encoding;
+        }
+
+        UnsupportedPcmEncoding(int encoding, String header) {
+            super("暂不支持这台设备输出的 PCM 编码：" + encoding + "（文件是 " + header + "）");
+            this.encoding = encoding;
         }
     }
 }

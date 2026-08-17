@@ -42,12 +42,26 @@ final class PlaybackHealth {
     private volatile int leadInFrames;
     private volatile int leadInArmings;
 
-    private final String label;
+    /** Which machine is being rendered. Set from the thread that builds the renderer. */
+    private volatile String label;
     private int sampleRate;
 
     PlaybackHealth(String label) {
         this.label = label;
         lastReportUptimeMs = SystemClock.uptimeMillis();
+    }
+
+    /**
+     * Names the machine the following reports describe.
+     *
+     * <p>The renderer can be swapped mid-track, and a report that keeps naming the machine the
+     * session started on is worse than no name: the cost of each machine is exactly what these
+     * lines are read for.</p>
+     */
+    void setLabel(String label) {
+        if (label != null && !label.isEmpty()) {
+            this.label = label;
+        }
     }
 
     void setSampleRate(int rate) {

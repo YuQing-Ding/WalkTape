@@ -8,6 +8,15 @@ interface TapeMachineDsp {
     default void setDolbyMode(DolbyMode mode) {
     }
 
+    /**
+     * The BBE processor's slide switch, on machines that carry one.
+     *
+     * <p>Only the HS-JX707 does. Everything else keeps the no-op, so a caller that sets it
+     * unconditionally does not have to know which machine is loaded.</p>
+     */
+    default void setBbeEnabled(boolean enabled) {
+    }
+
     /** Normalised pack position lets physical transports derive reel radius and back tension. */
     default void setTapePosition(float position) {
     }

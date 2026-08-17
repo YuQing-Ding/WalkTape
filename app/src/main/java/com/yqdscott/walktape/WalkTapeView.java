@@ -67,6 +67,9 @@ public final class WalkTapeView extends View {
         default void onDolbyModeChanged(DolbyMode mode) {
         }
 
+        default void onBbeEnabledChanged(boolean enabled) {
+        }
+
         default void onMachineProfileChanged(TapeMachineProfile profile) {
         }
 
@@ -138,6 +141,7 @@ public final class WalkTapeView extends View {
     private static final String ACTION_HOTLINE = "hotline";
     private static final String ACTION_TONE = "tone";
     private static final String ACTION_DOLBY = "dolby";
+    private static final String ACTION_BBE = "bbe";
     private static final String ACTION_SEEK = "seek";
     private static final String ACTION_MINI_PLAYER = "mini_player";
     private static final String ACTION_MINI_PLAY = "mini_play";
@@ -153,6 +157,7 @@ public final class WalkTapeView extends View {
     private static final String ACTION_RECORD_LEVEL = "record_level";
     private static final String ACTION_MACHINE_PROFILE = "machine_profile";
     private static final String ACTION_TAPE_PROFILE = "tape_profile";
+    private static final String ACTION_TAPE_SERIES = "tape_series";
     private static final String ACTION_CONDITION_PROFILE = "condition_profile";
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
@@ -221,6 +226,9 @@ public final class WalkTapeView extends View {
     private boolean hotlinePressActive;
     private boolean highTape = true;
     private DolbyMode dolbyMode = DolbyMode.OFF;
+    /** Which stock family the picker has drilled into, or null at the top level. */
+    private String expandedStockSeries;
+    private boolean bbeEnabled;
     private RecordLevelProfile recordLevel = RecordLevelProfile.standard();
 
     // The machine chassis is almost entirely static but used to be rebuilt on every reel frame.
@@ -417,6 +425,19 @@ public final class WalkTapeView extends View {
         dolbyMode = selected;
         recyclePlayerStaticFrame();
         invalidate();
+    }
+
+    public void setBbeEnabled(boolean enabled) {
+        if (bbeEnabled == enabled) {
+            return;
+        }
+        bbeEnabled = enabled;
+        recyclePlayerStaticFrame();
+        invalidate();
+    }
+
+    public boolean isBbeEnabled() {
+        return bbeEnabled;
     }
 
     public DolbyMode getDolbyMode() {
@@ -2064,6 +2085,7 @@ public final class WalkTapeView extends View {
                     dolbyTrack.top + third * 2f, hitRight, dolbyTrack.bottom), 0);
         } else if (profile.isAiwaHsJx707()) {
             addHit(ACTION_DOLBY, expand(aiwaDolbyBadge(body), dp(5)), -1);
+            addHit(ACTION_BBE, expand(aiwaBbeBadge(body), dp(4)), -1);
         }
     }
 
@@ -2703,22 +2725,29 @@ public final class WalkTapeView extends View {
             float badgeWidth = index == 2 ? dp(42) : dp(23);
             RectF badge = new RectF(badgeLeft, badgeTop,
                     badgeLeft + badgeWidth, badgeTop + dp(14));
-            boolean dolbySelected = index == 2 && dolbyMode != DolbyMode.OFF;
-            paint.setColor(dolbySelected ? 0xff292315 : 0xff111311);
+            boolean lit = (index == 0 && bbeEnabled)
+                    || (index == 2 && dolbyMode != DolbyMode.OFF);
+            paint.setColor(lit ? 0xff292315 : 0xff111311);
             canvas.drawRoundRect(badge, dp(1.5f), dp(1.5f), paint);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(dp(0.45f));
-            paint.setColor(dolbySelected ? 0xffd7b444 : 0x72c6b687);
+            paint.setColor(lit ? 0xffd7b444 : 0x72c6b687);
             canvas.drawRoundRect(badge, dp(1.5f), dp(1.5f), paint);
             paint.setStyle(Paint.Style.FILL);
             drawText(canvas, badges[index], badge.centerX(), badge.centerY() + dp(1.8f),
-                    dp(3.6f), dolbySelected ? 0xffffd968 : 0xffbcae88,
+                    dp(3.6f), lit ? 0xffffd968 : 0xffbcae88,
                     condensedFace, Paint.Align.CENTER, 0.35f);
             badgeLeft = badge.right + dp(3);
         }
 
         drawMechanicalControls(canvas, body);
         drawHeadphoneJacks(canvas, body);
+    }
+
+    /** The first of the three shell badges. Its geometry is duplicated from the draw loop. */
+    private RectF aiwaBbeBadge(RectF body) {
+        return new RectF(body.left + dp(8), body.top + dp(12),
+                body.left + dp(31), body.top + dp(26));
     }
 
     private RectF aiwaDolbyBadge(RectF body) {
@@ -3544,9 +3573,11 @@ public final class WalkTapeView extends View {
                 break;
             case ACTION_SETTINGS_CLOSE:
                 settingsTarget = 0f;
+                expandedStockSeries = null;
                 break;
             case ACTION_SETTINGS_SECTION:
                 settingsSection = Math.max(0, Math.min(3, target.index));
+                expandedStockSeries = null;
                 announceForAccessibility(settingsSection == 0
                         ? "磁带机列表" : settingsSection == 1
                         ? "磁带配方列表" : settingsSection == 2
@@ -3575,7 +3606,19 @@ public final class WalkTapeView extends View {
                             + " " + selectedProfile.model);
                 }
                 break;
+            case ACTION_TAPE_SERIES: {
+                List<TapeStockProfile> stocks = TapeStockProfile.availableProfiles();
+                if (target.index >= 0 && target.index < stocks.size()) {
+                    expandedStockSeries = stocks.get(target.index).seriesId;
+                    announceForAccessibility(stocks.get(target.index).model + " SERIES");
+                } else {
+                    expandedStockSeries = null;
+                }
+                invalidate();
+                break;
+            }
             case ACTION_TAPE_PROFILE:
+                expandedStockSeries = null;
                 List<TapeStockProfile> tapeProfiles = TapeStockProfile.availableProfiles();
                 if (target.index >= 0 && target.index < tapeProfiles.size()) {
                     TapeStockProfile selectedTape = tapeProfiles.get(target.index);
@@ -3763,6 +3806,15 @@ public final class WalkTapeView extends View {
                     listener.onToneChanged(highTape);
                 }
                 announceForAccessibility(highTape ? profile.highTapeLabel : profile.lowTapeLabel);
+                break;
+            case ACTION_BBE:
+                if (profile.isAiwaHsJx707()) {
+                    setBbeEnabled(!bbeEnabled);
+                    if (listener != null) {
+                        listener.onBbeEnabledChanged(bbeEnabled);
+                    }
+                    announceForAccessibility(bbeEnabled ? "BBE on" : "BBE off");
+                }
                 break;
             case ACTION_DOLBY:
                 if (profile.supportsDolbyBC()) {
@@ -4103,7 +4155,8 @@ public final class WalkTapeView extends View {
                     : profile.isSonyWmD6c()
                     ? "MACHINE PATH · QUARTZ SERVO / DOLBY " + dolbyMode.label
                     : profile.isAiwaHsJx707()
-                    ? "MACHINE PATH · DOLBY " + dolbyMode.label + " / DSL + BBE OFF"
+                    ? "MACHINE PATH · DOLBY " + dolbyMode.label + " / DSL OFF + BBE "
+                            + (bbeEnabled ? "ON" : "OFF")
                     : "MACHINE PATH · TONE / OUTPUT STAGE";
         } else if (settingsSection == 1) {
             settingsFooter = "TAPE PATH · EQ / MOL / SOL / PARTICLE NOISE";
@@ -4205,36 +4258,119 @@ public final class WalkTapeView extends View {
                                       float contentRight,
                                       float top,
                                       float bottom) {
-        List<TapeStockProfile> profiles = TapeStockProfile.availableProfiles();
-        float gap = dp(6);
-        float cardHeight = (bottom - top - gap * (profiles.size() - 1)) / profiles.size();
+        List<TapeStockProfile> all = TapeStockProfile.availableProfiles();
+        boolean drilled = expandedStockSeries != null;
+        List<TapeStockProfile> cards = drilled
+                ? TapeStockProfile.seriesMembers(expandedStockSeries)
+                : TapeStockProfile.topLevelProfiles();
+        if (cards.isEmpty()) {
+            expandedStockSeries = null;
+            cards = TapeStockProfile.topLevelProfiles();
+            drilled = false;
+        }
+
         float y = top;
-        for (int index = 0; index < profiles.size(); index++) {
-            TapeStockProfile candidate = profiles.get(index);
-            boolean selected = candidate.id.equals(tapeProfile.id);
+        if (drilled) {
+            RectF back = new RectF(contentLeft, y, contentRight, y + dp(19));
+            paint.setColor(0x401f211f);
+            canvas.drawRoundRect(back, dp(5), dp(5), paint);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(dp(0.65f));
+            paint.setColor(0x3e8b877d);
+            canvas.drawRoundRect(back, dp(5), dp(5), paint);
+            paint.setStyle(Paint.Style.FILL);
+            drawText(canvas, "\u2039  ALL STOCK", back.left + dp(12),
+                    back.centerY() + dp(1.9f), dp(4.4f), MUTED_INK,
+                    labelFace, Paint.Align.LEFT, 1.0f);
+            drawText(canvas, cards.get(0).manufacturer + "  " + seriesName(cards),
+                    back.right - dp(12), back.centerY() + dp(1.9f), dp(4.4f),
+                    cards.get(0).accentColor, labelFace, Paint.Align.RIGHT, 1.0f);
+            addHit(ACTION_TAPE_SERIES, back, -1);
+            y = back.bottom + dp(6);
+        }
+
+        float gap = dp(6);
+        float cardHeight = (bottom - y - gap * (cards.size() - 1)) / cards.size();
+        for (int index = 0; index < cards.size(); index++) {
+            TapeStockProfile candidate = cards.get(index);
+            boolean seriesCard = !drilled && candidate.hasSeries();
+            List<TapeStockProfile> members = seriesCard
+                    ? TapeStockProfile.seriesMembers(candidate.seriesId)
+                    : java.util.Collections.<TapeStockProfile>emptyList();
+            TapeStockProfile loadedMember = null;
+            if (seriesCard) {
+                for (TapeStockProfile member : members) {
+                    if (member.id.equals(tapeProfile.id)) {
+                        loadedMember = member;
+                    }
+                }
+            }
+            boolean selected = seriesCard
+                    ? loadedMember != null
+                    : candidate.id.equals(tapeProfile.id);
             int accent = candidate.accentColor;
             RectF card = new RectF(contentLeft, y, contentRight, y + cardHeight);
             drawSettingsCardFrame(canvas, card, selected, accent);
 
             float cardLeft = card.left + dp(12);
             float cardRight = card.right - dp(12);
-            drawText(canvas, candidate.manufacturer + "  /  " + candidate.year,
-                    cardLeft, card.top + dp(12), dp(4.5f), selected ? accent : MUTED_INK,
-                    labelFace, Paint.Align.LEFT, 1.0f);
-            drawText(canvas, candidate.typeShortLabel(), cardRight, card.top + dp(12),
-                    dp(4.4f), selected ? accent : 0xff78736a,
-                    labelFace, Paint.Align.RIGHT, 0.95f);
-            drawText(canvas, candidate.model, cardLeft, card.top + dp(28), dp(11.2f), INK,
-                    displayFace, Paint.Align.LEFT, 0.42f);
-            drawEllipsizedText(canvas, candidate.character, cardLeft, card.top + dp(41),
-                    cardRight - cardLeft, dp(4.25f), 0xffa49c8c,
-                    labelFace, Paint.Align.LEFT);
-            drawEllipsizedText(canvas, candidate.compactSpec(), cardLeft, card.top + dp(53),
-                    cardRight - cardLeft, dp(4.0f), 0xff706c64,
-                    condensedFace, Paint.Align.LEFT);
-            addHit(ACTION_TAPE_PROFILE, card, index);
+            String heading = seriesCard
+                    ? candidate.manufacturer + "  /  " + members.get(0).year + "\u2013"
+                            + members.get(members.size() - 1).year
+                    : candidate.manufacturer + "  /  " + candidate.year;
+            // Four top-level cards leave each one shorter than the three it replaced, so the four
+            // text rows have to close up or the last falls outside its own frame.
+            boolean compact = cardHeight < dp(59);
+            drawText(canvas, heading, cardLeft, card.top + dp(compact ? 10f : 12f),
+                    dp(compact ? 4.2f : 4.5f),
+                    selected ? accent : MUTED_INK, labelFace, Paint.Align.LEFT, 1.0f);
+            drawText(canvas, seriesCard ? members.size() + " GENERATIONS \u203a"
+                            : candidate.typeShortLabel(),
+                    cardRight, card.top + dp(compact ? 10f : 12f), dp(compact ? 4.1f : 4.4f),
+                    selected ? accent : 0xff78736a, labelFace, Paint.Align.RIGHT, 0.95f);
+            drawText(canvas, seriesCard ? seriesName(members) : candidate.model,
+                    cardLeft, card.top + dp(compact ? 25f : 28f), dp(compact ? 9.4f : 11.2f),
+                    INK, displayFace, Paint.Align.LEFT, 0.42f);
+            drawEllipsizedText(canvas,
+                    seriesCard ? "SONY TYPE I LINE \u00b7 TAP TO CHOOSE" : candidate.character,
+                    cardLeft, card.top + dp(compact ? 34.5f : 41f), cardRight - cardLeft,
+                    dp(compact ? 4.0f : 4.25f), 0xffa49c8c, labelFace, Paint.Align.LEFT);
+            drawEllipsizedText(canvas,
+                    seriesCard
+                            ? (loadedMember != null ? "LOADED \u00b7 " + loadedMember.model
+                                    : membersSummary(members))
+                            : candidate.compactSpec(),
+                    cardLeft, card.top + dp(compact ? 43.5f : 53f), cardRight - cardLeft,
+                    dp(compact ? 3.85f : 4.0f), 0xff706c64, condensedFace, Paint.Align.LEFT);
+            if (seriesCard) {
+                addHit(ACTION_TAPE_SERIES, card, all.indexOf(candidate));
+            } else {
+                addHit(ACTION_TAPE_PROFILE, card, all.indexOf(candidate));
+            }
             y = card.bottom + gap;
         }
+    }
+
+    /** The family's own name, which is the shortest model string among its generations. */
+    private static String seriesName(List<TapeStockProfile> members) {
+        String shortest = members.get(0).model;
+        for (TapeStockProfile member : members) {
+            if (member.model.length() < shortest.length()) {
+                shortest = member.model;
+            }
+        }
+        return shortest;
+    }
+
+    private static String membersSummary(List<TapeStockProfile> members) {
+        StringBuilder text = new StringBuilder();
+        for (TapeStockProfile member : members) {
+            if (text.length() > 0) {
+                text.append("  \u00b7  ");
+            }
+            text.append(member.model);
+        }
+        return text.toString();
     }
 
     /**
@@ -4281,8 +4417,11 @@ public final class WalkTapeView extends View {
                                            float bottom) {
         List<MachineConditionProfile> profiles =
                 MachineConditionProfile.availableProfiles();
-        float gap = dp(6);
+        // Four presets no longer fit at the roomy spacing, so the gap tightens and the rows close
+        // up, the same way the machine cards already handle their fourth entry.
+        float gap = dp(profiles.size() > 3 ? 3f : 6f);
         float cardHeight = (bottom - top - gap * (profiles.size() - 1)) / profiles.size();
+        boolean compact = cardHeight < dp(62);
         float y = top;
         for (int index = 0; index < profiles.size(); index++) {
             MachineConditionProfile candidate = profiles.get(index);
@@ -4293,19 +4432,22 @@ public final class WalkTapeView extends View {
 
             float cardLeft = card.left + dp(12);
             float cardRight = card.right - dp(12);
-            drawText(canvas, candidate.levelLabel, cardLeft, card.top + dp(12),
+            float headerY = card.top + dp(compact ? 10f : 12f);
+            drawText(canvas, candidate.levelLabel, cardLeft, headerY,
                     dp(4.5f), selected ? accent : MUTED_INK,
                     labelFace, Paint.Align.LEFT, 1.0f);
             drawText(canvas, candidate.isCalibrated() ? "0" : "CHARACTER",
-                    cardRight, card.top + dp(12), dp(4.4f),
+                    cardRight, headerY, dp(4.4f),
                     selected ? accent : 0xff78736a,
                     labelFace, Paint.Align.RIGHT, 0.95f);
-            drawText(canvas, candidate.name, cardLeft, card.top + dp(28),
-                    dp(11.2f), INK, displayFace, Paint.Align.LEFT, 0.42f);
-            drawEllipsizedText(canvas, candidate.character, cardLeft, card.top + dp(41),
+            drawText(canvas, candidate.name, cardLeft, card.top + dp(compact ? 24f : 28f),
+                    dp(compact ? 9.6f : 11.2f), INK, displayFace, Paint.Align.LEFT, 0.42f);
+            drawEllipsizedText(canvas, candidate.character, cardLeft,
+                    card.top + dp(compact ? 35f : 41f),
                     cardRight - cardLeft, dp(4.25f), 0xffa49c8c,
                     labelFace, Paint.Align.LEFT);
-            drawEllipsizedText(canvas, candidate.compactSpec, cardLeft, card.top + dp(53),
+            drawEllipsizedText(canvas, candidate.compactSpec, cardLeft,
+                    card.top + dp(compact ? 45f : 53f),
                     cardRight - cardLeft, dp(4.0f), 0xff706c64,
                     condensedFace, Paint.Align.LEFT);
             addHit(ACTION_CONDITION_PROFILE, card, index);

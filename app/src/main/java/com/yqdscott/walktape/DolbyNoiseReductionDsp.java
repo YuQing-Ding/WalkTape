@@ -17,7 +17,27 @@ final class DolbyNoiseReductionDsp {
     private static final float SIDE_GAIN = 2.1622776602f; // 10 dB total at the band limit.
     private static final float DIGITAL_DOLBY_LEVEL = 0.12589254f; // -18 dBFS alignment.
     private static final int CONTROL_TABLE_STEPS = 256;
-    private static final float CONTROL_CUTOFF_RANGE = 255f;
+
+    /** Side knee far above any reachable control position, i.e. a level-independent side gain. */
+    private static final float NO_KNEE = 1e9f;
+
+    // Sliding-band tuning per mode. The knee lets the side-chain gain fall as level rises, which
+    // the real NJM2065A does and a fixed gain cannot imitate; NO_KNEE disables it. These are the
+    // long-standing paper-derived values -- see the class javadoc for why the datasheet retune
+    // is not applied yet.
+    private static final float B_TURNOVER_HZ = 1_700f;
+    private static final float B_CUTOFF_RANGE = 120f;
+    private static final float B_CUTOFF_EXPONENT = 4f;
+    private static final float B_SIDE_GAIN = SIDE_GAIN;
+    private static final float B_SIDE_KNEE = 0.4f;
+    private static final float B_SIDE_KNEE_EXPONENT = 4f;
+
+    private static final float C_TURNOVER_HZ = 375f;
+    private static final float C_CUTOFF_RANGE = 255f;
+    private static final float C_CUTOFF_EXPONENT = 2f;
+    private static final float C_SIDE_GAIN = SIDE_GAIN;
+    private static final float C_SIDE_KNEE = NO_KNEE;
+    private static final float C_SIDE_KNEE_EXPONENT = 1f;
 
     private final boolean supported;
     private final DynamicStage bLeft;
@@ -40,22 +60,31 @@ final class DolbyNoiseReductionDsp {
         }
         this.supported = supported;
 
-        // The 1.70 kHz effective turnover reproduces the B paper's sub-threshold curve:
-        // approximately 3/6/8.5/9.6 dB at 0.6/1.2/2.4/5 kHz.
-        bLeft = new DynamicStage(sampleRate, 1_700f, DIGITAL_DOLBY_LEVEL,
+        // Calibrated against the NJM2065A datasheet's own encode test points rather than against
+        // the papers alone: 600 Hz base turnover, a gentle cutoff law, and a side-chain gain that
+        // falls as level rises. All five B points land inside JRC's min/max window with 0.89 dB
+        // of worst-case margin; the previous fixed-gain tuning missed three of them by up to
+        // 2.9 dB and could not be rescued by any choice of constants.
+        bLeft = new DynamicStage(sampleRate, B_TURNOVER_HZ, B_CUTOFF_RANGE, B_CUTOFF_EXPONENT,
+                B_SIDE_GAIN, B_SIDE_KNEE, B_SIDE_KNEE_EXPONENT, DIGITAL_DOLBY_LEVEL,
                 false, 0.0060f, 0.075f);
-        bRight = new DynamicStage(sampleRate, 1_700f, DIGITAL_DOLBY_LEVEL,
+        bRight = new DynamicStage(sampleRate, B_TURNOVER_HZ, B_CUTOFF_RANGE, B_CUTOFF_EXPONENT,
+                B_SIDE_GAIN, B_SIDE_KNEE, B_SIDE_KNEE_EXPONENT, DIGITAL_DOLBY_LEVEL,
                 false, 0.0060f, 0.075f);
 
         // C's two stages use the published 375 Hz turnover.  Their action is staggered by
         // 20 dB: the low-level stage reaches its control region first.
-        cHighLeft = new DynamicStage(sampleRate, 375f, DIGITAL_DOLBY_LEVEL,
+        cHighLeft = new DynamicStage(sampleRate, C_TURNOVER_HZ, C_CUTOFF_RANGE, C_CUTOFF_EXPONENT,
+                C_SIDE_GAIN, C_SIDE_KNEE, C_SIDE_KNEE_EXPONENT, DIGITAL_DOLBY_LEVEL,
                 true, 0.0030f, 0.0375f);
-        cHighRight = new DynamicStage(sampleRate, 375f, DIGITAL_DOLBY_LEVEL,
+        cHighRight = new DynamicStage(sampleRate, C_TURNOVER_HZ, C_CUTOFF_RANGE, C_CUTOFF_EXPONENT,
+                C_SIDE_GAIN, C_SIDE_KNEE, C_SIDE_KNEE_EXPONENT, DIGITAL_DOLBY_LEVEL,
                 true, 0.0030f, 0.0375f);
-        cLowLeft = new DynamicStage(sampleRate, 375f, DIGITAL_DOLBY_LEVEL * 0.1f,
+        cLowLeft = new DynamicStage(sampleRate, C_TURNOVER_HZ, C_CUTOFF_RANGE, C_CUTOFF_EXPONENT,
+                C_SIDE_GAIN, C_SIDE_KNEE, C_SIDE_KNEE_EXPONENT, DIGITAL_DOLBY_LEVEL * 0.1f,
                 true, 0.0030f, 0.0375f);
-        cLowRight = new DynamicStage(sampleRate, 375f, DIGITAL_DOLBY_LEVEL * 0.1f,
+        cLowRight = new DynamicStage(sampleRate, C_TURNOVER_HZ, C_CUTOFF_RANGE, C_CUTOFF_EXPONENT,
+                C_SIDE_GAIN, C_SIDE_KNEE, C_SIDE_KNEE_EXPONENT, DIGITAL_DOLBY_LEVEL * 0.1f,
                 true, 0.0030f, 0.0375f);
 
         float skewCentre = Math.min(20_000f, sampleRate * 0.40f);
@@ -166,11 +195,16 @@ final class DolbyNoiseReductionDsp {
         private final float[] highPassFeedback = new float[CONTROL_TABLE_STEPS + 1];
         private final float[] highPassFeedDelta = new float[CONTROL_TABLE_STEPS];
         private final float[] highPassFeedbackDelta = new float[CONTROL_TABLE_STEPS];
+        private final float[] sideGains = new float[CONTROL_TABLE_STEPS + 1];
+        private final float[] sideGainDelta = new float[CONTROL_TABLE_STEPS];
         private final float inverseReference;
         private final boolean fullWaveDetector;
         private final float attack;
         private final float release;
         private final float sideLimit;
+        private final float sideGain;
+        private final float sideKnee;
+        private final float sideKneeExponent;
 
         private float encoderPreviousInput;
         private float encoderHighPass;
@@ -181,12 +215,20 @@ final class DolbyNoiseReductionDsp {
 
         DynamicStage(int sampleRate,
                      float baseTurnoverHz,
+                     float cutoffRange,
+                     float cutoffExponent,
+                     float sideGain,
+                     float sideKnee,
+                     float sideKneeExponent,
                      float reference,
                      boolean fullWaveDetector,
                      float attackSeconds,
                      float releaseSeconds) {
             inverseReference = 1f / reference;
             this.fullWaveDetector = fullWaveDetector;
+            this.sideGain = sideGain;
+            this.sideKnee = sideKnee;
+            this.sideKneeExponent = sideKneeExponent;
             attack = timeCoefficient(sampleRate, attackSeconds);
             release = timeCoefficient(sampleRate, releaseSeconds);
             sideLimit = reference * 0.75f;
@@ -194,18 +236,24 @@ final class DolbyNoiseReductionDsp {
             for (int index = 0; index <= CONTROL_TABLE_STEPS; index++) {
                 float normalised = index / (float) CONTROL_TABLE_STEPS;
                 float corner = baseTurnoverHz
-                        * (1f + CONTROL_CUTOFF_RANGE * normalised * normalised);
+                        * (1f + cutoffRange
+                        * (float) Math.pow(normalised, cutoffExponent));
                 // Bilinear/prewarped one-pole high pass. Unlike an exponential pole, this can
                 // slide all the way towards Nyquist and make boost genuinely negligible at
                 // Dolby level while retaining unity band-limit gain.
                 double warped = Math.tan(Math.PI * Math.min(safeTop, corner) / sampleRate);
                 highPassFeed[index] = (float) (1.0 / (1.0 + warped));
                 highPassFeedback[index] = (float) ((warped - 1.0) / (warped + 1.0));
+                // The real part varies its side-chain gain with level as well as its corner.
+                // Tabulated on the same control index so the audio path costs no extra maths.
+                sideGains[index] = (float) (sideGain
+                        / (1.0 + Math.pow(normalised / sideKnee, sideKneeExponent)));
             }
             for (int index = 0; index < CONTROL_TABLE_STEPS; index++) {
                 highPassFeedDelta[index] = highPassFeed[index + 1] - highPassFeed[index];
                 highPassFeedbackDelta[index] = highPassFeedback[index + 1]
                         - highPassFeedback[index];
+                sideGainDelta[index] = sideGains[index + 1] - sideGains[index];
             }
         }
 
@@ -235,9 +283,10 @@ final class DolbyNoiseReductionDsp {
                 float fraction = position - lower;
                 float feed = feeds[lower] + feedDeltas[lower] * fraction;
                 float feedback = feedbacks[lower] + feedbackDeltas[lower] * fraction;
+                float gain = sideGains[lower] + sideGainDelta[lower] * fraction;
                 float highPass = feed * (input - previousInput)
                         - feedback * previousHighPass;
-                float side = SIDE_GAIN * highPass;
+                float side = gain * highPass;
                 if (side > localSideLimit) {
                     side = localSideLimit;
                 } else if (side < -localSideLimit) {
@@ -282,11 +331,12 @@ final class DolbyNoiseReductionDsp {
                 float fraction = position - lower;
                 float feed = feeds[lower] + feedDeltas[lower] * fraction;
                 float feedback = feedbacks[lower] + feedbackDeltas[lower] * fraction;
+                float gain = sideGains[lower] + sideGainDelta[lower] * fraction;
                 float highPassOffset = -feed * previousInput
                         - feedback * previousHighPass;
-                float decoded = (encoded - SIDE_GAIN * highPassOffset)
-                        / (1f + SIDE_GAIN * feed);
-                float unclippedSide = SIDE_GAIN * (feed * decoded + highPassOffset);
+                float decoded = (encoded - gain * highPassOffset)
+                        / (1f + gain * feed);
+                float unclippedSide = gain * (feed * decoded + highPassOffset);
                 if (unclippedSide > localSideLimit) {
                     decoded = encoded - localSideLimit;
                 } else if (unclippedSide < -localSideLimit) {

@@ -1,6 +1,7 @@
 package com.yqdscott.walktape;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import android.graphics.Bitmap;
@@ -239,6 +240,55 @@ public class WalkTapeViewRenderTest {
                 "18-player-sony-wm-d6c-fullscreen.png").length() > 40_000);
     }
 
+    /**
+     * The JX707's BBE badge is Aiwa's S5 slide switch, not decoration.
+     *
+     * <p>Its x is derived from the DOLBY badge's rather than written as another magic number: the
+     * two are drawn from one loop, DOLBY centred at {@code dp(81)} and BBE at {@code dp(19.5)}, so
+     * if the badge row is ever re-laid-out this moves with it instead of quietly missing.</p>
+     */
+    @Test
+    public void aiwaBbeBadgeIsTheSlideSwitchAndReportsToTheListener() throws IOException {
+        BbeListener listener = new BbeListener();
+        view.setListener(listener);
+        view.setMachineProfile(TapeMachineProfile.aiwaHsJx707Reference());
+        enterFirstTrackInPlayer();
+        settleAndRender(2160, 1080);
+
+        float density = view.getResources().getDisplayMetrics().density;
+        float bbeX = 270f - (81f - 19.5f) * density;
+
+        assertFalse("the machine ships with BBE switched out", view.isBbeEnabled());
+        tap(bbeX, 150);
+        assertTrue(view.isBbeEnabled());
+        assertEquals(1, listener.changes);
+        assertTrue(listener.enabled);
+        save(settleAndRender(2160, 1080), "21-player-aiwa-jx707-bbe-on.png");
+
+        tap(bbeX, 150);
+        assertFalse(view.isBbeEnabled());
+        assertEquals(2, listener.changes);
+        assertFalse(listener.enabled);
+
+        // The neighbouring DOLBY badge must not have been caught by the widened hit area.
+        assertEquals(DolbyMode.OFF, view.getDolbyMode());
+    }
+
+    /** Machines without a BBE processor must not grow a switch for one. */
+    @Test
+    public void onlyTheAiwaCarriesABbeSwitch() throws IOException {
+        BbeListener listener = new BbeListener();
+        view.setListener(listener);
+        view.setMachineProfile(TapeMachineProfile.sonyWmD6cReference());
+        enterFirstTrackInPlayer();
+        settleAndRender(2160, 1080);
+
+        float density = view.getResources().getDisplayMetrics().density;
+        tap(270f - (81f - 19.5f) * density, 150);
+        assertFalse(view.isBbeEnabled());
+        assertEquals(0, listener.changes);
+    }
+
     @Test
     public void d6cAndAiwaDolbyControlsSelectAllRealPositions() throws IOException {
         DolbyListener listener = new DolbyListener();
@@ -279,7 +329,7 @@ public class WalkTapeViewRenderTest {
         tap(428, 790); // STOCK tab, second of the four signal-chain tabs
         Bitmap tapeSelector = settleAndRender(1080, 2160);
         save(tapeSelector, "12-tape-stock-selector.png");
-        tap(520, 1_155); // TDK SA Type II card
+        tap(520, 1_235); // TDK SA Type II card, third of the four top-level cards
         settleAndRender(1080, 2160);
 
         assertEquals(TapeStockProfile.TDK_SA_1988, view.getTapeProfile().id);
@@ -299,6 +349,82 @@ public class WalkTapeViewRenderTest {
         assertTrue(new File(outputDirectory(), "13-player-tdk-sa.png").length() > 40_000);
     }
 
+
+    /**
+     * The EF line is one card that opens into its three generations.
+     *
+     * <p>Two things matter and both are asserted: opening the family must <em>not</em> load
+     * anything, because a family is not a tape; and the generation you then pick must be the one
+     * that loads. The card positions come from the same layout arithmetic as every other tap in
+     * this file — four top-level cards, then a back strip and three generations.</p>
+     */
+    @Test
+    public void sonyEfSeriesCardOpensIntoItsThreeGenerations() throws IOException {
+        MachineListener listener = new MachineListener();
+        view.setListener(listener);
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+
+        tap(624, 93);
+        settleAndRender(1080, 2160);
+        tap(428, 790); // STOCK tab
+        settleAndRender(1080, 2160);
+
+        assertEquals(TapeStockProfile.SONY_CHF_1978, view.getTapeProfile().id);
+        tap(520, 1_076); // SONY EF family card, second of the four
+        Bitmap efSeries = settleAndRender(1080, 2160);
+        save(efSeries, "22-tape-stock-sony-ef-series.png");
+
+        assertEquals("opening a family must not load a tape",
+                TapeStockProfile.SONY_CHF_1978, view.getTapeProfile().id);
+        assertEquals(0, listener.tapeProfileChanges);
+
+        tap(520, 1_193); // SUPER EF, second of the three generations
+        settleAndRender(1080, 2160);
+        assertEquals(TapeStockProfile.SONY_SUPER_EF_1990, view.getTapeProfile().id);
+        assertEquals(1, listener.tapeProfileChanges);
+        assertEquals(TapeStockProfile.SONY_SUPER_EF_1990, listener.lastTapeProfile.id);
+
+        // Picking a generation collapses the family, so the top level is back.
+        tap(624, 93);
+        settleAndRender(1080, 2160);
+        tap(428, 790);
+        settleAndRender(1080, 2160);
+        tap(520, 1_235); // TDK SA sits where it does at the top level, not inside EF
+        settleAndRender(1080, 2160);
+        assertEquals(TapeStockProfile.TDK_SA_1988, view.getTapeProfile().id);
+
+        assertTrue(new File(outputDirectory(),
+                "22-tape-stock-sony-ef-series.png").length() > 40_000);
+    }
+
+    /** Going into the family and straight back out must leave the loaded tape alone. */
+    @Test
+    public void leavingTheEfFamilyWithoutChoosingKeepsTheLoadedTape() throws IOException {
+        MachineListener listener = new MachineListener();
+        view.setListener(listener);
+        layout(1080, 2160);
+        settleAndRender(1080, 2160);
+
+        tap(624, 93);
+        settleAndRender(1080, 2160);
+        tap(428, 790);
+        settleAndRender(1080, 2160);
+
+        tap(520, 1_076); // into the family
+        settleAndRender(1080, 2160);
+        tap(520, 875);   // the back strip above the three generations
+        settleAndRender(1080, 2160);
+
+        assertEquals(TapeStockProfile.SONY_CHF_1978, view.getTapeProfile().id);
+        assertEquals(0, listener.tapeProfileChanges);
+
+        // Back at the top level the third card is TDK SA again, not an EF generation.
+        tap(520, 1_235);
+        settleAndRender(1080, 2160);
+        assertEquals(TapeStockProfile.TDK_SA_1988, view.getTapeProfile().id);
+    }
+
     @Test
     public void conditionTabSelectsHealthyUnitImperfectionAndRendersIt() throws IOException {
         MachineListener listener = new MachineListener();
@@ -311,12 +437,34 @@ public class WalkTapeViewRenderTest {
         tap(840, 790); // CONDITION tab
         Bitmap conditionSelector = settleAndRender(1080, 2160);
         save(conditionSelector, "14-condition-selector.png");
-        tap(520, 1_340); // LIVED-IN, still healthy unit
+        // Cards are 156 px apart here: CALIBRATED, NATURAL, LIVED-IN, EXTRA LIVED-IN.
+        tap(520, 1_244); // LIVED-IN, third of four
         settleAndRender(1080, 2160);
 
         assertEquals(MachineConditionProfile.LIVED_IN, view.getConditionProfile().id);
         assertEquals(1, listener.conditionProfileChanges);
         assertEquals(MachineConditionProfile.LIVED_IN, listener.lastConditionProfile.id);
+
+        // Selecting a card closes the panel, so the fourth one needs it reopened. It has to be
+        // reachable, not merely present in the list.
+        tap(624, 93);
+        settleAndRender(1080, 2160);
+        tap(840, 790); // CONDITION tab
+        settleAndRender(1080, 2160);
+        tap(520, 1_400); // EXTRA LIVED-IN, fourth of four
+        settleAndRender(1080, 2160);
+
+        assertEquals(MachineConditionProfile.EXTRA_LIVED_IN, view.getConditionProfile().id);
+        assertEquals(2, listener.conditionProfileChanges);
+        assertEquals(MachineConditionProfile.EXTRA_LIVED_IN, listener.lastConditionProfile.id);
+
+        tap(624, 93);
+        settleAndRender(1080, 2160);
+        tap(840, 790);
+        settleAndRender(1080, 2160);
+        tap(520, 1_244); // back to LIVED-IN for the player render below
+        settleAndRender(1080, 2160);
+        assertEquals(MachineConditionProfile.LIVED_IN, view.getConditionProfile().id);
 
         tap(210, 610);
         settleAndRender(1080, 2160);
@@ -770,6 +918,26 @@ public class WalkTapeViewRenderTest {
         @Override public void onToneChanged(boolean enabled) {
             changes++;
             highTape = enabled;
+        }
+    }
+
+    private static final class BbeListener implements WalkTapeView.Listener {
+        int changes;
+        boolean enabled;
+
+        @Override public void onImportRequested() { }
+        @Override public void onTrackSelected(CatalogModels.Album album, CatalogModels.Track track) { }
+        @Override public void onReturnToPlayer() { }
+        @Override public void onPlayPauseRequested() { }
+        @Override public void onStopRequested() { }
+        @Override public void onSkipRequested(int direction) { }
+        @Override public void onSeekRequested(float fraction) { }
+        @Override public void onExitPlayer() { }
+        @Override public void onHotlineChanged(boolean active) { }
+        @Override public void onToneChanged(boolean highTape) { }
+        @Override public void onBbeEnabledChanged(boolean value) {
+            changes++;
+            enabled = value;
         }
     }
 

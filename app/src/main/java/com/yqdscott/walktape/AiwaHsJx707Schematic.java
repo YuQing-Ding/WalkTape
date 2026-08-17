@@ -259,6 +259,10 @@ final class AiwaHsJx707Schematic {
         capacitor(parts, "C86", 220e-6, Role.HEADPHONE_OUTPUT);
         capacitor(parts, "C83", 0.22e-6, Role.HEADPHONE_OUTPUT);
         capacitor(parts, "C84", 0.22e-6, Role.HEADPHONE_OUTPUT);
+        // Zobel damping from the output to ground, in series with C84. Only the right channel's
+        // designator was legible on the drawing, so only that one is recorded; the left channel
+        // plainly carries the same network beside C83 but its reference has not been read.
+        resistor(parts, "R68", 4.7, Role.HEADPHONE_OUTPUT);
         inductor(parts, "L12", 3.3e-6, "chip coil S 3.3uH", Role.HEADPHONE_OUTPUT);
         inductor(parts, "L13", 0, "loading coil", Role.HEADPHONE_OUTPUT);
         inductor(parts, "L14", 3.3e-6, "chip coil S 3.3uH", Role.HEADPHONE_OUTPUT);
@@ -295,6 +299,10 @@ final class AiwaHsJx707Schematic {
         prior(parts, "P-HP-LOAD", 32.0, "ohm", "rated headphone load", Role.REFERENCE_LOAD);
         prior(parts, "P-BATT-R", 0.34, "ohm", "cell plus contact resistance",
                 Role.SUPPLY_FILTER);
+        // The XRC5484 has no BBE level control on this machine, so its process boost is whatever
+        // Aiwa fixed it at, and nothing in the manual says. 6 dB is near the middle of the range
+        // the licensed family offers across its switchable parts: 3, 6, 7, 9, 11 and 12 dB.
+        prior(parts, "P-BBE-PROCESS-DB", 6.0, "dB", "BBE process boost at 10 kHz", Role.BBE_DSL);
 
         HashMap<String, Part> index = new HashMap<>();
         for (Part part : parts) {

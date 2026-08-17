@@ -61,6 +61,9 @@ public final class TpsL2Dsp implements TapeMachineDsp {
     private final float azimuthStepSine;
     private final float azimuthStepCosine;
     private final float startupDecay;
+    private final TapeTransportDynamics transport;
+    private final StereoBiquad spacingLoss;
+    private int transportControlCountdown;
 
     private final StereoOnePoleShelf recordPreEmphasis;
     private final StereoOnePoleShelf playbackDeEmphasis;
@@ -150,8 +153,13 @@ public final class TpsL2Dsp implements TapeMachineDsp {
                 * STARTUP_TIME_CONSTANT_SECONDS * sampleRate * 1.02;
         // Extra margin covers stochastic scrape flutter and the inter-channel azimuth offset.
         baseDelaySamples = (float) (maximumExcursion + maximumCamExcursion + 8.0);
+        // The capstan spin-up is a separate, much shorter effect from the servo settling above:
+        // one is the flywheel reaching speed in a third of a second, the other is the servo
+        // trimming a fraction of a percent over ten. Both accumulate into this line, so both
+        // have to be reserved.
+        float maximumSlipSamples = sampleRate * 0.5f;
         int requestedDelaySize = (int) Math.ceil(baseDelaySamples + maximumExcursion
-                + maximumCamExcursion + maximumStartupDelay + 16.0);
+                + maximumCamExcursion + maximumStartupDelay + maximumSlipSamples + 16.0);
         int delaySize = 1;
         while (delaySize < requestedDelaySize) {
             delaySize <<= 1;
@@ -159,6 +167,11 @@ public final class TpsL2Dsp implements TapeMachineDsp {
         delayLeft = new float[delaySize];
         delayRight = new float[delaySize];
         delayMask = delaySize - 1;
+        transport = new TapeTransportDynamics(sampleRate, TRANSPORT_CONTROL_STRIDE,
+                maximumSlipSamples);
+        // Head-to-tape spacing loss: as the head backs off, short wavelengths go first.
+        spacingLoss = StereoBiquad.lowPass(sampleRate,
+                Math.min(2_600f, sampleRate * 0.43f), 0.7071f);
         double azimuthStep = TWO_PI * 0.17 * TRANSPORT_CONTROL_STRIDE / sampleRate;
         azimuthStepSine = (float) Math.sin(azimuthStep);
         azimuthStepCosine = (float) Math.cos(azimuthStep);
@@ -222,6 +235,7 @@ public final class TpsL2Dsp implements TapeMachineDsp {
     @Override
     public void setTransportState(TapeTransportState state) {
         electromechanics.setTransportState(state);
+        transport.setState(state);
     }
 
     @Override
@@ -265,6 +279,9 @@ public final class TpsL2Dsp implements TapeMachineDsp {
         azimuthInterpolationStep = 0f;
         startupSlowdown = STARTUP_SLOWDOWN;
         startupDelaySamples = 0f;
+        transport.reset();
+        spacingLoss.reset();
+        transportControlCountdown = 0;
         electromechanicalDelaySamples = 0f;
         transportFramesUntilUpdate = 0;
         saturationEnvelope = 0f;
@@ -318,6 +335,12 @@ public final class TpsL2Dsp implements TapeMachineDsp {
                 right = tapeRight.process(right, saturationEnvelope);
             }
 
+            if (transportControlCountdown <= 0) {
+                transport.advance(TRANSPORT_CONTROL_STRIDE);
+                transportControlCountdown = TRANSPORT_CONTROL_STRIDE;
+            }
+            transportControlCountdown--;
+
             if (transportEnabled) {
                 delayLeft[writeIndex] = left;
                 delayRight[writeIndex] = right;
@@ -337,6 +360,19 @@ public final class TpsL2Dsp implements TapeMachineDsp {
                 // mathematically identical without inventing separate left/right pitch wobble.
                 right = quadraticRead(delayRight, wrapReadPosition(readPosition + azimuth));
                 writeIndex = (writeIndex + 1) & delayMask;
+            }
+
+            // Where the head is: ahead of every electrical stage. Treble goes before level, so
+            // a retracting head dulls the sound on its way out rather than simply fading.
+            float spacedLeft = spacingLoss.processLeft(left);
+            float spacedRight = spacingLoss.processRight(right);
+            float contact = transport.headContact();
+            float headGain = transport.headOutputGain();
+            if (contact < 0.9995f || headGain < 0.9995f) {
+                left = spacedLeft + (left - spacedLeft) * contact;
+                right = spacedRight + (right - spacedRight) * contact;
+                left *= headGain;
+                right *= headGain;
             }
 
             if (saturationEnabled) {
@@ -522,7 +558,8 @@ public final class TpsL2Dsp implements TapeMachineDsp {
         electromechanicalDelaySamples = Math.max(-6f,
                 Math.min(6f, electromechanicalDelaySamples));
         float targetDelay = baseDelaySamples + startupDelaySamples
-                + electromechanicalDelaySamples + camDelay + randomDelay;
+                + electromechanicalDelaySamples + camDelay + randomDelay
+                + transport.slipSamples();
         for (int component = 0; component < transportSine.length; component++) {
             float sine = transportSine[component];
             float cosine = transportCosine[component];

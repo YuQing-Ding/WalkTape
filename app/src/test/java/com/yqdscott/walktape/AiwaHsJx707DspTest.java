@@ -47,29 +47,49 @@ public class AiwaHsJx707DspTest {
     }
 
     /**
-     * The bass end must come from C19 and R17, not from a spec-derived high-pass.
+     * No spec-derived high-pass survives anywhere in the chain.
      *
-     * <p>Below about 40 Hz the head contour prior has almost no say, so the rendered response
-     * should land on the traced network's own departure from the IEC curve. A 63 Hz Butterworth
-     * high-pass, which is what used to shape this end, would be roughly 20 dB down at 20 Hz
-     * instead of 4.5.</p>
+     * <p>A 63 Hz Butterworth, which is what used to shape this end before the replay equaliser and
+     * the output coupling were both derived, would be roughly 20 dB down at 20 Hz. Two real
+     * first-order rolloffs are not: they cost about 8 dB together. This is the guard against
+     * someone re-adding a shaping filter on top of the components.</p>
      */
     @Test
-    public void theBassTurnoverIsTheTracedNetworksRatherThanASpecShelf() {
-        AiwaHsJx707ReplayEq reference = new AiwaHsJx707ReplayEq();
+    public void noSpecShapedHighPassRemainsInTheChain() {
+        for (boolean metal : new boolean[]{false, true}) {
+            assertTrue("20 Hz is far deeper than two first-order rolloffs can account for",
+                    responseDb(20f, metal) > -11.0);
+            assertTrue("63 Hz must stay essentially intact",
+                    responseDb(63f, metal) > -2.5);
+        }
+    }
+
+    /**
+     * The subsonic end is now two derived rolloffs in series, not one.
+     *
+     * <p>The replay equaliser's own C19/R17 turnover and the C86 output coupling into the rated
+     * load are separate stages of the real machine, so they add. Below 40 Hz the head contour has
+     * almost no say, which makes this a direct check that both are present and neither is being
+     * counted twice.</p>
+     */
+    @Test
+    public void theSubsonicEndIsTheReplayTurnoverPlusTheOutputCoupling() {
+        AiwaHsJx707ReplayEq replay = new AiwaHsJx707ReplayEq();
+        AiwaHsJx707OutputStage output = new AiwaHsJx707OutputStage();
         for (boolean metal : new boolean[]{false, true}) {
             double treble = metal ? AiwaHsJx707ReplayEq.IEC_METAL_SECONDS
                     : AiwaHsJx707ReplayEq.IEC_NORMAL_SECONDS;
             for (double frequency : new double[]{20.0, 25.0, 31.5}) {
-                double expected = reference.relativeResponseDb(frequency, metal)
-                        - AiwaHsJx707ReplayEq.relativeTargetDb(frequency, treble);
-                assertEquals("Rendered bass must follow the solved network at " + frequency
+                double expected = replay.relativeResponseDb(frequency, metal)
+                        - AiwaHsJx707ReplayEq.relativeTargetDb(frequency, treble)
+                        + output.relativeResponseDb(frequency);
+                assertEquals("Both derived rolloffs must appear at " + frequency
                                 + " Hz, metal=" + metal,
                         expected, responseDb((float) frequency, metal), 0.35);
             }
-            assertTrue("A spec high-pass would bury 20 Hz far deeper than the network does",
-                    responseDb(20f, metal) > -6.0);
         }
+        assertTrue("The coupling capacitor has to cost real subsonic level",
+                responseDb(20f, false) < -6.5);
     }
 
     /**
@@ -78,9 +98,13 @@ public class AiwaHsJx707DspTest {
      */
     @Test
     public void theMidbandCarriesOnlyTheDerivedReplayError() {
+        AiwaHsJx707OutputStage output = new AiwaHsJx707OutputStage();
         for (boolean metal : new boolean[]{false, true}) {
             for (float frequency : new float[]{63f, 100f, 200f, 400f, 800f, 2_000f}) {
-                double response = responseDb(frequency, metal);
+                // Take the output coupling back out; what is left should be only the small
+                // replay error and the head contour prior.
+                double response = responseDb(frequency, metal)
+                        - output.relativeResponseDb(frequency);
                 assertTrue("Midband deviation at " + frequency + " Hz, metal=" + metal
                         + " was " + response, Math.abs(response) < 1.2);
             }

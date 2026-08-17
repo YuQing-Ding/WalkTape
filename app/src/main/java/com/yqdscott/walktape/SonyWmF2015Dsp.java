@@ -179,7 +179,8 @@ public final class SonyWmF2015Dsp implements TapeMachineDsp {
         conditionAzimuthDriftSamples = MachineImperfectionDsp.FULL_AZIMUTH_DRIFT_SAMPLES
                 * conditionProfile.transportScale;
         conditionSoftenRight = (unitSeed & 1L) == 0L;
-        conditionHighFrequencyBlend = Math.min(0.08f,
+        conditionHighFrequencyBlend = Math.min(
+                MachineImperfectionDsp.HIGH_FREQUENCY_BLEND_CEILING,
                 conditionProfile.highFrequencyMismatchDb * 0.155f);
         conditionHighFrequencyPole = cutoffCoefficient(sampleRate,
                 Math.min(7_200f, sampleRate * 0.35f));

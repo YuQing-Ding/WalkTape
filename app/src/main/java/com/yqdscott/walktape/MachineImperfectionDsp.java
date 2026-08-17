@@ -17,6 +17,8 @@ final class MachineImperfectionDsp implements TapeMachineDsp {
     // Full LIVED-IN preset is 0.0284% RMS additional speed variation.
     static final double[] FULL_SPEED_PEAK = {0.00014, 0.00034, 0.00016};
     static final float FULL_AZIMUTH_DRIFT_SAMPLES = 0.018f;
+    /** Shared with {@link SonyWmF2015Dsp}, which builds the same mismatch from the same preset. */
+    static final float HIGH_FREQUENCY_BLEND_CEILING = 0.12f;
 
     private final MachineConditionProfile profile;
     private final float[] delayLeft;
@@ -94,8 +96,11 @@ final class MachineImperfectionDsp implements TapeMachineDsp {
         float rightGain = dbToLinear(leftHotter ? -halfBalance : halfBalance);
         softenRight = leftHotter;
         // Mixing a 7.2 kHz one-pole path back at this low ratio produces the requested gentle
-        // head-sensitivity mismatch without imposing a conspicuous filter on either channel.
-        highFrequencyBlend = Math.min(0.08f,
+        // head-sensitivity mismatch without imposing a conspicuous filter on either channel. The
+        // ceiling exists to keep that filter inaudible as a filter; EXTRA LIVED-IN is the first
+        // preset that deliberately uses the upper part of the range, so it sits above the 0.08
+        // that bounded the original three.
+        highFrequencyBlend = Math.min(HIGH_FREQUENCY_BLEND_CEILING,
                 profile.highFrequencyMismatchDb * 0.155f);
         float extraCrosstalk = profile.extraCrosstalk;
         float crosstalkNormalise = 1f / (1f + extraCrosstalk);

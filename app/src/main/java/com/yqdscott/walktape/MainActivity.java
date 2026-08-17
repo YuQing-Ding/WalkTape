@@ -39,6 +39,7 @@ public class MainActivity extends AppCompatActivity implements
     private static final String KEY_TAPE_PROFILE = "tape_profile";
     private static final String KEY_MACHINE_CONDITION = "machine_condition";
     private static final String KEY_DOLBY_MODE = "dolby_mode";
+    private static final String KEY_BBE_ENABLED = "bbe_enabled";
     private static final String KEY_RECORD_LEVEL = "record_level";
     private final Handler progressHandler = new Handler(Looper.getMainLooper());
     private final float[] playbackMeterLevels = new float[2];
@@ -120,6 +121,8 @@ public class MainActivity extends AppCompatActivity implements
         DolbyMode savedDolbyMode = DolbyMode.forId(
                 getSharedPreferences(PREFERENCES, MODE_PRIVATE)
                         .getString(KEY_DOLBY_MODE, DolbyMode.OFF.id));
+        boolean savedBbe = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                .getBoolean(KEY_BBE_ENABLED, false);
         playbackController.setMachineProfile(savedProfile);
         playbackController.setTapeProfile(savedTapeProfile);
         RecordLevelProfile savedRecordLevel = RecordLevelProfile.forId(
@@ -128,11 +131,13 @@ public class MainActivity extends AppCompatActivity implements
         playbackController.setConditionProfile(savedCondition);
         playbackController.setRecordLevel(savedRecordLevel);
         playbackController.setDolbyMode(savedDolbyMode);
+        playbackController.setBbeEnabled(savedBbe);
         walkTapeView.setMachineProfile(savedProfile);
         walkTapeView.setTapeProfile(savedTapeProfile);
         walkTapeView.setConditionProfile(savedCondition);
         walkTapeView.setRecordLevel(savedRecordLevel);
         walkTapeView.setDolbyMode(savedDolbyMode);
+        walkTapeView.setBbeEnabled(savedBbe);
         if (savedProfile.usesTapeTypeSelector()) {
             boolean highPosition = savedTapeProfile.isHighPosition();
             playbackController.setHighTape(highPosition);
@@ -180,8 +185,8 @@ public class MainActivity extends AppCompatActivity implements
             } else if (track != null) {
                 walkTapeView.setTrackLyrics(track.id, LyricsRepository.Result.error(
                         "WalkTape 的网络权限未开启；请在应用权限中允许网络访问"));
-                Toast.makeText(this, "允许 WalkTape 使用网络后才能在线匹配歌词",
-                        Toast.LENGTH_LONG).show();
+                AppToast.show(this, "允许 WalkTape 使用网络后才能在线匹配歌词",
+                        Toast.LENGTH_LONG);
             }
             return;
         }
@@ -190,13 +195,13 @@ public class MainActivity extends AppCompatActivity implements
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
             walkTapeView.setHotlineActive(false);
             if (!granted) {
-                Toast.makeText(this, "HOT LINE 需要麦克风权限才能把现场声音送进耳机",
-                        Toast.LENGTH_LONG).show();
+                AppToast.show(this, "HOT LINE 需要麦克风权限才能把现场声音送进耳机",
+                        Toast.LENGTH_LONG);
             } else {
                 // The runtime-permission sheet ends the original press. Never leave the mic live
                 // after that gesture; the listener explicitly presses again to begin monitoring.
-                Toast.makeText(this, "麦克风权限已授予；请重新按住 HOT LINE 说话",
-                        Toast.LENGTH_SHORT).show();
+                AppToast.show(this, "麦克风权限已授予；请重新按住 HOT LINE 说话",
+                        Toast.LENGTH_SHORT);
             }
             return;
         }
@@ -208,8 +213,8 @@ public class MainActivity extends AppCompatActivity implements
             startMusicLibraryIfNeeded();
         } else {
             walkTapeView.showMusicPermissionRequired();
-            Toast.makeText(this, "授予音乐访问权限后，WalkTape 才能自动建立磁带架",
-                    Toast.LENGTH_LONG).show();
+            AppToast.show(this, "授予音乐访问权限后，WalkTape 才能自动建立磁带架",
+                    Toast.LENGTH_LONG);
         }
     }
 
@@ -325,6 +330,15 @@ public class MainActivity extends AppCompatActivity implements
                 .putString(KEY_DOLBY_MODE, selected.id)
                 .apply();
         playbackController.setDolbyMode(selected);
+    }
+
+    @Override
+    public void onBbeEnabledChanged(boolean enabled) {
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_BBE_ENABLED, enabled)
+                .apply();
+        playbackController.setBbeEnabled(enabled);
     }
 
     @Override
@@ -444,8 +458,8 @@ public class MainActivity extends AppCompatActivity implements
         } catch (ActivityNotFoundException exception) {
             pendingSettingsLyricsAlbum = null;
             pendingSettingsLyricsTrack = null;
-            Toast.makeText(this, "请在系统设置中允许 WalkTape 使用网络",
-                    Toast.LENGTH_LONG).show();
+            AppToast.show(this, "请在系统设置中允许 WalkTape 使用网络",
+                    Toast.LENGTH_LONG);
         }
     }
 
@@ -487,7 +501,7 @@ public class MainActivity extends AppCompatActivity implements
         try {
             startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(track.lyricsSourceUrl)));
         } catch (ActivityNotFoundException exception) {
-            Toast.makeText(this, "没有可打开歌词来源的浏览器", Toast.LENGTH_SHORT).show();
+            AppToast.show(this, "没有可打开歌词来源的浏览器", Toast.LENGTH_SHORT);
         }
     }
 
@@ -512,13 +526,13 @@ public class MainActivity extends AppCompatActivity implements
     public void onError(String message) {
         PlaybackKeepAliveService.stop(this);
         walkTapeView.setPlaying(false);
-        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+        AppToast.show(this, message, Toast.LENGTH_LONG);
     }
 
     @Override
     public void onHotlineStopped(String message) {
         walkTapeView.setHotlineActive(false);
-        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+        AppToast.show(this, message, Toast.LENGTH_LONG);
     }
 
     private void startHotlineMonitoring() {
@@ -526,11 +540,11 @@ public class MainActivity extends AppCompatActivity implements
         boolean started = result == PlaybackController.HotlineResult.STARTED;
         walkTapeView.setHotlineActive(started);
         if (result == PlaybackController.HotlineResult.NEED_HEADPHONES) {
-            Toast.makeText(this, "请先连接有线、USB 或蓝牙耳机；扬声器监听会产生啸叫",
-                    Toast.LENGTH_LONG).show();
+            AppToast.show(this, "请先连接有线、USB 或蓝牙耳机；扬声器监听会产生啸叫",
+                    Toast.LENGTH_LONG);
         } else if (result == PlaybackController.HotlineResult.AUDIO_UNAVAILABLE) {
-            Toast.makeText(this, "当前音频线路无法启动 HOT LINE",
-                    Toast.LENGTH_LONG).show();
+            AppToast.show(this, "当前音频线路无法启动 HOT LINE",
+                    Toast.LENGTH_LONG);
         }
     }
 
@@ -562,9 +576,9 @@ public class MainActivity extends AppCompatActivity implements
                     String detail = update.added + " 首新增 · "
                             + update.removed + " 首移除 · "
                             + update.changed + " 首更新";
-                    Toast.makeText(MainActivity.this,
+                    AppToast.show(MainActivity.this,
                             "曲库同步完成：" + detail,
-                            Toast.LENGTH_SHORT).show();
+                            Toast.LENGTH_SHORT);
                 }
             }
 
@@ -578,8 +592,8 @@ public class MainActivity extends AppCompatActivity implements
                 walkTapeView.setLibrarySyncing(syncing);
                 if (!syncing && manualRefreshRequested) {
                     manualRefreshRequested = false;
-                    Toast.makeText(MainActivity.this, "曲库已经是最新状态",
-                            Toast.LENGTH_SHORT).show();
+                    AppToast.show(MainActivity.this, "曲库已经是最新状态",
+                            Toast.LENGTH_SHORT);
                 }
             }
 
@@ -587,7 +601,7 @@ public class MainActivity extends AppCompatActivity implements
             public void onError(String message) {
                 manualRefreshRequested = false;
                 walkTapeView.showLibraryError();
-                Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+                AppToast.show(MainActivity.this, message, Toast.LENGTH_LONG);
             }
         });
     }

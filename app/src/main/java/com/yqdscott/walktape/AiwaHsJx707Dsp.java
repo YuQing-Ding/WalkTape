@@ -69,6 +69,13 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
     private final StereoPeaking headContour;
     private final StereoBiquad normalBandwidth;
     private final StereoBiquad metalBandwidth;
+    private final StereoOnePoleHighPass outputCoupling;
+    private final BbeProcessor bbe;
+    private final TapeTransportDynamics transport;
+    private final StereoBiquad spacingLoss;
+    private final float bbeMixStep;
+    private final float clipKnee;
+    private final float clipCompression;
     private final TapeStage tapeLeft;
     private final TapeStage tapeRight;
     private final HissGenerator hissLeft;
@@ -79,6 +86,8 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
     private final float envelopeRelease;
 
     private volatile boolean highTape;
+    private volatile boolean bbeEnabled;
+    private float bbeMix;
     private float highTapeMix;
     private float saturationEnvelope;
     private int writeIndex;
@@ -91,6 +100,7 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
     private float azimuthCosine;
     private float interpolatedAzimuth;
     private float azimuthStep;
+    private int transportControlCountdown;
     private boolean modeTransitionActive;
     private boolean transitionTargetHigh;
 
@@ -134,7 +144,11 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
             maximumExcursion += Math.abs(delayAmplitude[component]);
         }
         baseDelaySamples = (float) maximumExcursion + 14f;
-        int requiredDelay = (int) Math.ceil(baseDelaySamples + maximumExcursion + 36f);
+        // Head room for the delay a spin-up accumulates: the tape runs slow for a few hundred
+        // milliseconds, and every sample of that shortfall has to live in this buffer.
+        float maximumSlipSamples = sampleRate * 0.5f;
+        int requiredDelay = (int) Math.ceil(baseDelaySamples + maximumExcursion + 36f
+                + maximumSlipSamples);
         int delaySize = 1;
         while (delaySize < requiredDelay) {
             delaySize <<= 1;
@@ -169,6 +183,28 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
         normalBandwidth = StereoBiquad.lowPass(sampleRate, Math.min(8_000f, safeTop), 0.7071f);
         metalBandwidth = StereoBiquad.lowPass(sampleRate, Math.min(12_500f, safeTop), 0.7071f);
 
+        // C86/C85 220u feeding the rated 32 ohm load. The Zobel and the chip coil in the same
+        // network sit at 154 kHz and 1.5 MHz, so this capacitor is the only part of the output
+        // that lands in the audio band.
+        AiwaHsJx707OutputStage output = new AiwaHsJx707OutputStage();
+        outputCoupling = new StereoOnePoleHighPass(sampleRate,
+                output.couplingTimeConstantSeconds());
+        clipKnee = (float) output.linearFractionOfSwing();
+        clipCompression = 1f / (1f - clipKnee);
+
+        // IC4's BBE, from the licensed BBE family rather than from the XRC5484, which nobody
+        // publishes. It sits where the real one does: after the replay chain and the head and tape
+        // losses, before the volume control and the main amplifier.
+        bbe = new BbeProcessor(sampleRate, new AiwaHsJx707Bbe());
+        // The keyed transport. Nothing about a mechanism this size happens on the sample the
+        // key goes down, so PLAY glides into tune and PAUSE coasts out of it.
+        transport = new TapeTransportDynamics(sampleRate, TRANSPORT_CONTROL_STRIDE,
+                maximumSlipSamples);
+        // Losing head contact costs treble before it costs level: the gap between head and
+        // oxide attenuates short wavelengths first, which is spacing loss.
+        spacingLoss = StereoBiquad.lowPass(sampleRate, Math.min(2_600f, safeTop), 0.7071f);
+        bbeMixStep = 1f / Math.max(1f, sampleRate * 0.025f);
+
         tapeLeft = new TapeStage(sampleRate, 0.026f);
         tapeRight = new TapeStage(sampleRate, -0.021f);
         envelopeAttack = timeCoefficient(sampleRate, 0.0028f);
@@ -185,6 +221,32 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
     @Override
     public void setHighTape(boolean enabled) {
         highTape = enabled;
+    }
+
+    /**
+     * Aiwa's S5 slide switch. Off is what this renderer has always shipped, so it stays the
+     * default and turning it on is the only thing that changes the sound.
+     */
+    /**
+     * A key press on the transport, which the mechanism then takes its own time to obey.
+     *
+     * <p>The renderer does not jump: PLAY winds the capstan up over a third of a second and the
+     * pitch rises into tune, PAUSE lets the tape coast to a halt against a head that is still
+     * touching it, STOP retracts the head so the sound goes before the tape does, and winding
+     * lifts the head clear.</p>
+     */
+    @Override
+    public void setTransportState(TapeTransportState state) {
+        transport.setState(state);
+    }
+
+    @Override
+    public void setBbeEnabled(boolean enabled) {
+        bbeEnabled = enabled;
+    }
+
+    public boolean isBbeEnabled() {
+        return bbeEnabled;
     }
 
     @Override
@@ -221,6 +283,14 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
         headContour.reset();
         normalBandwidth.reset();
         metalBandwidth.reset();
+        outputCoupling.reset();
+        bbe.reset();
+        // A renderer rebuilt at the audible playhead is a machine already running, so the
+        // transport settles rather than restarting: a seek must not sound like pressing PLAY.
+        transport.reset();
+        spacingLoss.reset();
+        transportControlCountdown = 0;
+        bbeMix = bbeEnabled ? 1f : 0f;
         tapeLeft.reset();
         tapeRight.reset();
         hissLeft.reset();
@@ -236,6 +306,12 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
         }
         final boolean targetHigh = highTape;
         final float targetMix = targetHigh ? 1f : 0f;
+        final float bbeTarget = bbeEnabled ? 1f : 0f;
+        if (bbeTarget > 0f && bbeMix <= 0f) {
+            // Coming back from fully off the filters hold nothing, so clear the detector too and
+            // let the 25 ms ramp cover the start-up transient.
+            bbe.reset();
+        }
         final float mixStep = 1f / Math.max(1f, sampleRate * 0.025f);
         float modeMix = highTapeMix;
         float envelope = saturationEnvelope;
@@ -281,6 +357,12 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
                 right = tapeRight.process(right, envelope, modeMix);
             }
 
+            if (transportControlCountdown <= 0) {
+                transport.advance(TRANSPORT_CONTROL_STRIDE);
+                transportControlCountdown = TRANSPORT_CONTROL_STRIDE;
+            }
+            transportControlCountdown--;
+
             if (transportEnabled) {
                 delayLeft[writeIndex] = left;
                 delayRight[writeIndex] = right;
@@ -294,6 +376,19 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
                 right = readDelay(delayRight, interpolatedDelay + interpolatedAzimuth);
                 writeIndex = (writeIndex + 1) & delayMask;
                 transportFramesUntilUpdate--;
+            }
+
+            // Head-to-tape contact, applied where the head is: before any of the electronics.
+            // Treble goes before level, because a gap between head and oxide attenuates short
+            // wavelengths first. Both filters keep running at full contact so re-engaging the
+            // head does not start from a cleared state.
+            float spacedLeft = spacingLoss.processLeft(left);
+            float spacedRight = spacingLoss.processRight(right);
+            float contact = transport.headContact();
+            float headGain = transport.headOutputGain();
+            if (contact < 0.9995f || headGain < 0.9995f) {
+                left = lerp(spacedLeft, left, contact) * headGain;
+                right = lerp(spacedRight, right, contact) * headGain;
             }
 
             if (saturationEnabled) {
@@ -331,16 +426,19 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
             left = headContour.processLeft(left);
             right = headContour.processRight(right);
 
-            if (hissEnabled) {
-                left += hissLeft.next();
-                right += hissRight.next();
+            if (hissEnabled || machineNoiseEnabled) {
+                if (hissEnabled) {
+                    left += hissLeft.next();
+                    right += hissRight.next();
+                }
+                // The running gear arrives and leaves with the motor rather than switching, and
+                // a key press adds one cam/lever thump that the chassis conducts into the head.
+                // Both ride the same mechanical bed because in the machine they are the same path.
                 float motor = motorBed.next();
-                left += motor;
-                right += motor * 0.87f;
-            } else if (machineNoiseEnabled) {
-                float motor = motorBed.next();
-                left += motor;
-                right += motor * 0.87f;
+                float mechanical = motor * transport.motorNoiseGain()
+                        + motor * transport.transitionEnergy() * 5.5f;
+                left += mechanical;
+                right += mechanical * 0.87f;
             }
 
             if (transitioning) {
@@ -358,8 +456,25 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
                 right = normalBandwidth.processRight(right);
             }
 
+            // IC4. The real one is switched in ahead of the volume control and the main amp, so
+            // it sees the machine's own band limits rather than a flat signal, which is why it
+            // goes after the bandwidth stage rather than at the head.
+            if (bbeTarget != bbeMix) {
+                bbeMix = bbeTarget > bbeMix
+                        ? Math.min(bbeTarget, bbeMix + bbeMixStep)
+                        : Math.max(bbeTarget, bbeMix - bbeMixStep);
+            }
+            if (bbeMix > 0f) {
+                float wetLeft = bbe.processLeft(left);
+                float wetRight = bbe.processRight(right);
+                left = bbeMix >= 1f ? wetLeft : lerp(left, wetLeft, bbeMix);
+                right = bbeMix >= 1f ? wetRight : lerp(right, wetRight, bbeMix);
+            }
+
             float crossedLeft = left + PROGRAM_CROSSTALK * right;
             float crossedRight = right + PROGRAM_CROSSTALK * left;
+            crossedLeft = outputCoupling.processLeft(crossedLeft);
+            crossedRight = outputCoupling.processRight(crossedRight);
             stereo[sample] = outputStage(crossedLeft);
             stereo[sample + 1] = outputStage(crossedRight);
         }
@@ -402,6 +517,10 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
         randomDelay = randomDelay * 0.99935f
                 + irregularFlutter.nextSpeedError() * TRANSPORT_CONTROL_STRIDE;
         targetDelay += randomDelay;
+        // Running slow means the programme arrives late. Feeding that shortfall into the same
+        // delay line the wow uses is what makes a spin-up an audible pitch glide rather than a
+        // fade: the read pointer falls behind the write pointer while the capstan catches up.
+        targetDelay += transport.slipSamples();
         delayStep = (targetDelay - interpolatedDelay) / TRANSPORT_CONTROL_STRIDE;
 
         float nextAzimuthSine = azimuthSine * azimuthStepCosine
@@ -458,14 +577,22 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
         return -56f;
     }
 
-    private static float outputStage(float input) {
+    /**
+     * The TA7688F running out of swing, with both constants derived rather than chosen.
+     *
+     * <p>The knee is where Toshiba's THD leaves its floor — 10 mW into 32 ohm, 0.533 of the
+     * available swing — and the curve's asymptote is the rail itself, which fixes the compression
+     * coefficient at {@code 1 / (1 - knee)} with nothing left to pick. 10% THD then falls near
+     * Toshiba's 27 mW point. The previous knee of 0.86 was invented and, worse, its ceiling of 1.04
+     * sat above the rail the part actually has.</p>
+     */
+    private float outputStage(float input) {
         float magnitude = Math.abs(input);
-        if (magnitude <= 0.86f) {
+        if (magnitude <= clipKnee) {
             return input;
         }
-        float excess = magnitude - 0.86f;
-        float rounded = 0.86f + excess / (1f + excess * 2.8f);
-        float limited = Math.min(1.04f, rounded);
+        float excess = magnitude - clipKnee;
+        float limited = Math.min(1f, clipKnee + excess / (1f + excess * clipCompression));
         return input < 0f ? -limited : limited;
     }
 
@@ -690,6 +817,214 @@ public final class AiwaHsJx707Dsp implements TapeMachineDsp {
             bassTurnover.reset();
             bassTrim.reset();
             trebleTilt.reset();
+        }
+    }
+
+    /**
+     * IC4's BBE, realtime.
+     *
+     * <p>Two networks that do not interact. The <b>magnitude</b> network is the through path plus a
+     * first-order low boost and a first-order high boost in parallel, which gives the family's
+     * characteristic V with its floor near 0 dB rather than below it. The <b>phase</b> network is
+     * two first-order all-pass sections at the two split frequencies, which is what puts the
+     * treble a full turn ahead of the bass — the part of BBE that is not equalisation.</p>
+     *
+     * <p>The high boost is level-dependent, as BBE II is: a detector opens it from about -48 dBFS
+     * and has it fully open by -28 dBFS. Both channels detect separately, which is what BD3860K
+     * does with its own DET1 and DET2 pins. The gain is recomputed on a stride and glided rather
+     * than applied per sample, because the detector's own 20 ms attack means nothing it produces
+     * needs sample-rate resolution.</p>
+     */
+    private static final class BbeProcessor {
+        private static final int CONTROL_STRIDE = 32;
+
+        private final float lowB0;
+        private final float lowA1;
+        private final float highB0;
+        private final float highA1;
+        private final float allPassLow;
+        private final float allPassHigh;
+        private final float loContourGain;
+        private final float processGain;
+        private final float attack;
+        private final float release;
+        private final float thresholdLinear;
+        private final float inverseSpanLog;
+        private final float gainGlide;
+
+        private float lowLeftX1;
+        private float lowLeftY1;
+        private float lowRightX1;
+        private float lowRightY1;
+        private float highLeftX1;
+        private float highLeftY1;
+        private float highRightX1;
+        private float highRightY1;
+        private float apLowLeft;
+        private float apHighLeft;
+        private float apLowRight;
+        private float apHighRight;
+        private float envelopeLeft;
+        private float envelopeRight;
+        private float openLeft;
+        private float openRight;
+        private float targetLeft;
+        private float targetRight;
+        private int strideLeft;
+        private int strideRight;
+
+        BbeProcessor(int sampleRate, AiwaHsJx707Bbe reference) {
+            // Prewarped bilinear, so the realtime corners land on the analogue prototype's rather
+            // than a few per cent below it. At 4.6 kHz against 48 kHz that difference is audible
+            // in a sweep even though it is small.
+            double lowK = Math.tan(Math.PI * Math.min(reference.lowSplitHertz(),
+                    sampleRate * 0.45) / sampleRate);
+            lowB0 = (float) (lowK / (1.0 + lowK));
+            lowA1 = (float) ((lowK - 1.0) / (1.0 + lowK));
+
+            double highK = Math.tan(Math.PI * Math.min(reference.processCornerHertz(),
+                    sampleRate * 0.45) / sampleRate);
+            highB0 = (float) (1.0 / (1.0 + highK));
+            highA1 = (float) ((highK - 1.0) / (1.0 + highK));
+
+            allPassLow = allPassCoefficient(sampleRate, reference.lowSplitHertz());
+            allPassHigh = allPassCoefficient(sampleRate, reference.highSplitHertz());
+
+            loContourGain = (float) reference.loContourPathGain();
+            processGain = (float) reference.processPathGain();
+
+            attack = timeCoefficient(sampleRate, (float) AiwaHsJx707Bbe.DETECTOR_ATTACK_SECONDS);
+            release = timeCoefficient(sampleRate, (float) AiwaHsJx707Bbe.DETECTOR_RELEASE_SECONDS);
+            thresholdLinear = (float) Math.pow(10.0, AiwaHsJx707Bbe.thresholdDbFs() / 20.0);
+            double span = (AiwaHsJx707Bbe.fullProcessDbFs() - AiwaHsJx707Bbe.thresholdDbFs()) / 20.0;
+            inverseSpanLog = (float) (1.0 / (span * Math.log(10.0)));
+            gainGlide = timeCoefficient(sampleRate, 0.005f);
+        }
+
+        private static float allPassCoefficient(int sampleRate, double hertz) {
+            double k = Math.tan(Math.PI * Math.min(hertz, sampleRate * 0.45) / sampleRate);
+            return (float) ((1.0 - k) / (1.0 + k));
+        }
+
+        float processLeft(float input) {
+            if (--strideLeft <= 0) {
+                strideLeft = CONTROL_STRIDE;
+                targetLeft = openingFor(envelopeLeft);
+            }
+            float magnitude = Math.abs(input);
+            envelopeLeft += (magnitude - envelopeLeft)
+                    * (magnitude > envelopeLeft ? attack : release);
+            openLeft += (targetLeft - openLeft) * gainGlide;
+
+            float low = lowB0 * (input + lowLeftX1) - lowA1 * lowLeftY1;
+            lowLeftX1 = input;
+            lowLeftY1 = low;
+            float high = highB0 * (input - highLeftX1) - highA1 * highLeftY1;
+            highLeftX1 = input;
+            highLeftY1 = high;
+
+            float summed = input + loContourGain * low + processGain * openLeft * high;
+
+            float stage = allPassLow * summed + apLowLeft;
+            apLowLeft = summed - allPassLow * stage;
+            float output = allPassHigh * stage + apHighLeft;
+            apHighLeft = stage - allPassHigh * output;
+            return output;
+        }
+
+        float processRight(float input) {
+            if (--strideRight <= 0) {
+                strideRight = CONTROL_STRIDE;
+                targetRight = openingFor(envelopeRight);
+            }
+            float magnitude = Math.abs(input);
+            envelopeRight += (magnitude - envelopeRight)
+                    * (magnitude > envelopeRight ? attack : release);
+            openRight += (targetRight - openRight) * gainGlide;
+
+            float low = lowB0 * (input + lowRightX1) - lowA1 * lowRightY1;
+            lowRightX1 = input;
+            lowRightY1 = low;
+            float high = highB0 * (input - highRightX1) - highA1 * highRightY1;
+            highRightX1 = input;
+            highRightY1 = high;
+
+            float summed = input + loContourGain * low + processGain * openRight * high;
+
+            float stage = allPassLow * summed + apLowRight;
+            apLowRight = summed - allPassLow * stage;
+            float output = allPassHigh * stage + apHighRight;
+            apHighRight = stage - allPassHigh * output;
+            return output;
+        }
+
+        /** BD3860K's Fig 16 read as a straight line in decibels between its two stated levels. */
+        private float openingFor(float envelope) {
+            if (envelope <= thresholdLinear) {
+                return 0f;
+            }
+            float opening = (float) Math.log(envelope / thresholdLinear) * inverseSpanLog;
+            return opening >= 1f ? 1f : opening;
+        }
+
+        void reset() {
+            lowLeftX1 = 0f;
+            lowLeftY1 = 0f;
+            lowRightX1 = 0f;
+            lowRightY1 = 0f;
+            highLeftX1 = 0f;
+            highLeftY1 = 0f;
+            highRightX1 = 0f;
+            highRightY1 = 0f;
+            apLowLeft = 0f;
+            apHighLeft = 0f;
+            apLowRight = 0f;
+            apHighRight = 0f;
+            envelopeLeft = 0f;
+            envelopeRight = 0f;
+            openLeft = 0f;
+            openRight = 0f;
+            targetLeft = 0f;
+            targetRight = 0f;
+            strideLeft = 0;
+            strideRight = 0;
+        }
+    }
+
+    /** {@code s*tau / (1 + s*tau)} by the bilinear transform: one series coupling capacitor. */
+    private static final class StereoOnePoleHighPass {
+        private final float b0;
+        private final float a1;
+        private float leftX1;
+        private float leftY1;
+        private float rightX1;
+        private float rightY1;
+
+        StereoOnePoleHighPass(int sampleRate, double tauSeconds) {
+            double term = 2.0 * sampleRate * tauSeconds;
+            b0 = (float) (term / (1.0 + term));
+            a1 = (float) ((1.0 - term) / (1.0 + term));
+        }
+
+        float processLeft(float input) {
+            float output = b0 * (input - leftX1) - a1 * leftY1;
+            leftX1 = input;
+            leftY1 = output;
+            return output;
+        }
+
+        float processRight(float input) {
+            float output = b0 * (input - rightX1) - a1 * rightY1;
+            rightX1 = input;
+            rightY1 = output;
+            return output;
+        }
+
+        void reset() {
+            leftX1 = 0f;
+            leftY1 = 0f;
+            rightX1 = 0f;
+            rightY1 = 0f;
         }
     }
 

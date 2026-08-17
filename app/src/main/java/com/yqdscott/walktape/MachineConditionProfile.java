@@ -15,6 +15,7 @@ public final class MachineConditionProfile {
     public static final String CALIBRATED = "condition_calibrated";
     public static final String NATURAL = "condition_natural";
     public static final String LIVED_IN = "condition_lived_in";
+    public static final String EXTRA_LIVED_IN = "condition_extra_lived_in";
 
     private static final MachineConditionProfile REFERENCE = new MachineConditionProfile(
             CALIBRATED,
@@ -58,9 +59,36 @@ public final class MachineConditionProfile {
             0.0020f
     );
 
+    /**
+     * An older survivor: still healthy, but no longer close to its alignment jig.
+     *
+     * <p>Every term is the same one the LIVED-IN preset uses, roughly doubled, and the character
+     * comes mostly from azimuth rather than from speed. That is what actually ages a portable:
+     * head wear and a drifted azimuth screw cost high-frequency coherence between the channels
+     * long before the bearings get noisy enough to hear. Speed variation is raised least, because
+     * a machine whose wow is audible as pitch is a machine that wants servicing, and this class
+     * describes units that do not.</p>
+     *
+     * <p>Still deliberately free of drop-outs, crackle and gross speed error: at +0.052% RMS this
+     * remains far inside every modelled machine's service limit, including the JX707's 0.45%.</p>
+     */
+    private static final MachineConditionProfile EXTRA_LIVED_IN_UNIT = new MachineConditionProfile(
+            EXTRA_LIVED_IN,
+            "EXTRA LIVED-IN",
+            "WELL-WORN / SERVICEABLE",
+            "WORN HEAD / DRIFTED AZIMUTH",
+            "+0.052% W&F  ·  ΔBAL 0.62 dB",
+            0xffb8392b,
+            1.85f,
+            0.62f,
+            2.40f,
+            0.62f,
+            0.0038f
+    );
+
     private static final List<MachineConditionProfile> AVAILABLE =
             Collections.unmodifiableList(Arrays.asList(
-                    REFERENCE, NATURAL_UNIT, LIVED_IN_UNIT));
+                    REFERENCE, NATURAL_UNIT, LIVED_IN_UNIT, EXTRA_LIVED_IN_UNIT));
 
     public final String id;
     public final String name;
@@ -112,6 +140,10 @@ public final class MachineConditionProfile {
         return LIVED_IN_UNIT;
     }
 
+    public static MachineConditionProfile extraLivedIn() {
+        return EXTRA_LIVED_IN_UNIT;
+    }
+
     public static List<MachineConditionProfile> availableProfiles() {
         return AVAILABLE;
     }
@@ -122,6 +154,9 @@ public final class MachineConditionProfile {
         }
         if (LIVED_IN.equals(id)) {
             return LIVED_IN_UNIT;
+        }
+        if (EXTRA_LIVED_IN.equals(id)) {
+            return EXTRA_LIVED_IN_UNIT;
         }
         return REFERENCE;
     }

@@ -13,8 +13,14 @@ import java.util.List;
  */
 public final class TapeStockProfile {
     public static final String SONY_CHF_1978 = "sony_chf_1978";
+    public static final String SONY_EF_1985 = "sony_ef_1985";
+    public static final String SONY_SUPER_EF_1990 = "sony_super_ef_1990";
+    public static final String SONY_EF_X_1995 = "sony_ef_x_1995";
     public static final String TDK_SA_1988 = "tdk_sa_1988";
     public static final String TDK_MA_X_1990 = "tdk_ma_x_1990";
+
+    /** Groups the three EF generations under one card in the picker. */
+    public static final String SERIES_SONY_EF = "sony_ef";
 
     private static final TapeStockProfile CHF = new TapeStockProfile(
             SONY_CHF_1978,
@@ -33,6 +39,8 @@ public final class TapeStockProfile {
             -0.8f,
             "EARLY FERRIC / DENSE GRAIN",
             0xffe95c2c,
+            null,
+            null,
             5.7f,
             4.4414f,
             3.3090f,
@@ -41,6 +49,100 @@ public final class TapeStockProfile {
             -66.48f,
             0.62f,
             0.0045f
+    );
+
+    // ---- The EF line. Sony never published laboratory figures for it and no independent lab
+    // ---- measured it either, so unlike CHF these three are *placed* rather than measured: each
+    // ---- figure is an interpolation inside a bracket whose ends were measured on the same deck
+    // ---- against the same reference tape. Super EF is the exception — three of its four
+    // ---- headline figures fall out of Sony's own printed comparison against EF. See
+    // ---- docs/TAPE_MEDIA_MODEL.md for the bracket and the arithmetic.
+
+    private static final TapeStockProfile EF = new TapeStockProfile(
+            SONY_EF_1985,
+            "SONY",
+            "EF",
+            1985,
+            1,
+            "FERRIC OXIDE",
+            "NORMAL POSITION",
+            120,
+            3.2f,
+            -1.6f,
+            -50.2f,
+            1.05f,
+            -1.5f,
+            -0.7f,
+            "BUDGET FERRIC / SOFT TOP END",
+            0xff6f9fa8,
+            SERIES_SONY_EF,
+            "EF",
+            5.7f,
+            3.9641f,
+            3.3500f,
+            0.4949f,
+            13_900f,
+            -65.98f,
+            0.58f,
+            0.0042f
+    );
+
+    private static final TapeStockProfile SUPER_EF = new TapeStockProfile(
+            SONY_SUPER_EF_1990,
+            "SONY",
+            "SUPER EF",
+            1990,
+            1,
+            "FERRIC OXIDE",
+            "NORMAL POSITION",
+            120,
+            3.0f,
+            -1.1f,
+            -50.7f,
+            0.85f,
+            -1.0f,
+            -0.5f,
+            "QUIETER COATING / WIDER RANGE",
+            0xff5a86c4,
+            SERIES_SONY_EF,
+            "SUPER EF",
+            5.7f,
+            4.5278f,
+            4.3500f,
+            0.3227f,
+            14_400f,
+            -66.48f,
+            0.52f,
+            0.0037f
+    );
+
+    private static final TapeStockProfile EF_X = new TapeStockProfile(
+            SONY_EF_X_1995,
+            "SONY",
+            "EF-X",
+            1995,
+            1,
+            "FERRIC OXIDE",
+            "NORMAL POSITION",
+            120,
+            4.0f,
+            -0.9f,
+            -51.8f,
+            0.62f,
+            -0.5f,
+            -0.4f,
+            "TOP OF THE EF LINE / NEAR HF",
+            0xffc46a4a,
+            SERIES_SONY_EF,
+            "EF-X",
+            5.7f,
+            3.9108f,
+            4.0000f,
+            0.4734f,
+            15_100f,
+            -67.58f,
+            0.45f,
+            0.0031f
     );
 
     private static final TapeStockProfile SA = new TapeStockProfile(
@@ -60,6 +162,8 @@ public final class TapeStockProfile {
             1.6f,
             "COBALT FERRIC / LOW NOISE",
             0xffd7a23a,
+            null,
+            null,
             4.7f,
             3.6105f,
             3.4512f,
@@ -87,6 +191,8 @@ public final class TapeStockProfile {
             1.2f,
             "PURE METAL / HIGH HEADROOM",
             0xffb8c7c9,
+            null,
+            null,
             4.45f,
             2.9190f,
             3.1871f,
@@ -98,7 +204,7 @@ public final class TapeStockProfile {
     );
 
     private static final List<TapeStockProfile> AVAILABLE = Collections.unmodifiableList(
-            Arrays.asList(CHF, SA, MA_X));
+            Arrays.asList(CHF, EF, SUPER_EF, EF_X, SA, MA_X));
 
     public final String id;
     public final String manufacturer;
@@ -116,6 +222,10 @@ public final class TapeStockProfile {
     public final float sensitivityDb;
     public final String character;
     public final int accentColor;
+    /** Non-null when this stock is one generation of a family shown as a single picker card. */
+    public final String seriesId;
+    /** Short name for this generation within its family, e.g. "SUPER EF". */
+    public final String seriesVariant;
 
     // Renderer calibration. These are solved so the rendered stock reproduces the published
     // measurements above; TapeStockCalibrationTest is the gate that keeps them honest. They are
@@ -145,6 +255,8 @@ public final class TapeStockProfile {
                              float sensitivityDb,
                              String character,
                              int accentColor,
+                             String seriesId,
+                             String seriesVariant,
                              float recordTrebleGainDb,
                              float magneticDrive,
                              float magneticKnee,
@@ -169,6 +281,8 @@ public final class TapeStockProfile {
         this.sensitivityDb = sensitivityDb;
         this.character = character;
         this.accentColor = accentColor;
+        this.seriesId = seriesId;
+        this.seriesVariant = seriesVariant;
         this.recordTrebleGainDb = recordTrebleGainDb;
         this.magneticDrive = magneticDrive;
         this.magneticKnee = magneticKnee;
@@ -195,6 +309,7 @@ public final class TapeStockProfile {
                 base.iecType, base.formulation, base.position, base.replayEqMicroseconds,
                 base.mol315Db, base.sol10kDb, base.biasNoiseDb, base.thdAtReferencePercent,
                 base.relativeBiasDb, base.sensitivityDb, base.character, base.accentColor,
+                base.seriesId, base.seriesVariant,
                 recordTrebleGainDb, magneticDrive, magneticKnee, maximumDynamicLoss,
                 base.coatingBandwidthHz, renderedHissRmsDb, base.modulationNoiseDepth,
                 base.coatingWanderDepth);
@@ -215,6 +330,18 @@ public final class TapeStockProfile {
         return CHF;
     }
 
+    public static TapeStockProfile sonyEf1985() {
+        return EF;
+    }
+
+    public static TapeStockProfile sonySuperEf1990() {
+        return SUPER_EF;
+    }
+
+    public static TapeStockProfile sonyEfX1995() {
+        return EF_X;
+    }
+
     public static TapeStockProfile tdkSa1988() {
         return SA;
     }
@@ -228,17 +355,70 @@ public final class TapeStockProfile {
     }
 
     public static TapeStockProfile forId(String id) {
-        if (TDK_SA_1988.equals(id)) {
-            return SA;
-        }
-        if (TDK_MA_X_1990.equals(id)) {
-            return MA_X;
+        for (TapeStockProfile profile : AVAILABLE) {
+            if (profile.id.equals(id)) {
+                return profile;
+            }
         }
         return CHF;
     }
 
+    public boolean hasSeries() {
+        return seriesId != null;
+    }
+
+    /**
+     * Every generation of one family, in the order they are offered.
+     *
+     * <p>Returned for the picker's second level. A stock with no family returns just itself, so a
+     * caller does not have to branch on {@link #hasSeries()}.</p>
+     */
+    public static List<TapeStockProfile> seriesMembers(String seriesId) {
+        if (seriesId == null) {
+            return Collections.emptyList();
+        }
+        java.util.ArrayList<TapeStockProfile> members = new java.util.ArrayList<>();
+        for (TapeStockProfile profile : AVAILABLE) {
+            if (seriesId.equals(profile.seriesId)) {
+                members.add(profile);
+            }
+        }
+        return Collections.unmodifiableList(members);
+    }
+
+    /**
+     * What the picker's top level shows: one entry per family, plus every ungrouped stock.
+     *
+     * <p>The family is represented by its first generation, which is also what selecting the
+     * family card without choosing a generation gives you.</p>
+     */
+    public static List<TapeStockProfile> topLevelProfiles() {
+        java.util.ArrayList<TapeStockProfile> cards = new java.util.ArrayList<>();
+        java.util.HashSet<String> seenSeries = new java.util.HashSet<>();
+        for (TapeStockProfile profile : AVAILABLE) {
+            if (profile.seriesId == null) {
+                cards.add(profile);
+            } else if (seenSeries.add(profile.seriesId)) {
+                cards.add(profile);
+            }
+        }
+        return Collections.unmodifiableList(cards);
+    }
+
     public boolean isHighPosition() {
         return iecType != 1;
+    }
+
+    /**
+     * Headroom above the noise floor, the way a tape laboratory reports it.
+     *
+     * <p>Maximum output level minus A-weighted bias noise. Worth knowing that this is not a
+     * convention invented here: it reproduces the published dynamic-range column exactly for the
+     * stock whose figures were taken from a lab rather than placed, which is what lets the EF
+     * generations be positioned against that column at all.</p>
+     */
+    public float dynamicRangeDb() {
+        return mol315Db - biasNoiseDb;
     }
 
     public String typeLabel() {
